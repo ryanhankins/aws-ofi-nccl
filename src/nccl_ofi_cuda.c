@@ -36,9 +36,10 @@ int nccl_net_ofi_gpuDeviceGetCount(int *count) {
 }
 
 #if CUDA_VERSION >= 11030
-int nccl_net_ofi_gpuFlushGPUDirectRDMAWrites(CUflushGPUDirectRDMAWritesTarget target,
-					              CUflushGPUDirectRDMAWritesScope scope) {
-	return nccl_net_ofi_cuFlushGPUDirectRDMAWrites(target, scope) == CUDA_SUCCESS ? GPU_SUCCESS : GPU_ERROR;
+int nccl_net_ofi_gpuFlushGPUDirectRDMAWrites() {
+	return nccl_net_ofi_cuFlushGPUDirectRDMAWrites(CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TARGET_CURRENT_CTX,
+						       CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TO_OWNER) ==
+						       CUDA_SUCCESS ? GPU_SUCCESS : GPU_ERROR;
 }
 #endif
 

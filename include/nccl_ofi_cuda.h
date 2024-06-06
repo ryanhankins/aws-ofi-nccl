@@ -40,8 +40,7 @@ extern int nccl_net_ofi_gpuCtxGetDevice(CUdevice *device);
 extern int nccl_net_ofi_gpuDeviceGetCount(int* count);
 
 #if CUDA_VERSION >= 11030
-extern int nccl_net_ofi_gpuFlushGPUDirectRDMAWrites(CUflushGPUDirectRDMAWritesTarget target,
-						    CUflushGPUDirectRDMAWritesScope scope);
+extern int nccl_net_ofi_gpuFlushGPUDirectRDMAWrites();
 #else
 extern void *nccl_net_ofi_gpuFlushGPUDirectRDMAWrites;
 #endif
