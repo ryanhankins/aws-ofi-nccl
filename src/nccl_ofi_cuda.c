@@ -12,15 +12,34 @@
 #include "nccl_ofi_cuda.h"
 #include "nccl_ofi_log.h"
 
-CUresult (*nccl_net_ofi_cuDriverGetVersion)(int *driverVersion) = NULL;
-CUresult (*nccl_net_ofi_cuPointerGetAttribute)(void *data, CUpointer_attribute attribute, CUdeviceptr ptr) = NULL;
-CUresult (*nccl_net_ofi_cuCtxGetDevice)(CUdevice *device) = NULL;
-CUresult (*nccl_net_ofi_cuDeviceGetCount)(int *count) = NULL;
+static CUresult (*nccl_net_ofi_cuDriverGetVersion)(int *driverVersion) = NULL;
+static CUresult (*nccl_net_ofi_cuPointerGetAttribute)(void *data, CUpointer_attribute attribute, CUdeviceptr ptr) = NULL;
+static CUresult (*nccl_net_ofi_cuCtxGetDevice)(CUdevice *device) = NULL;
+static CUresult (*nccl_net_ofi_cuDeviceGetCount)(int *count) = NULL;
 #if CUDA_VERSION >= 11030
-CUresult (*nccl_net_ofi_cuFlushGPUDirectRDMAWrites)(CUflushGPUDirectRDMAWritesTarget target,
-						    CUflushGPUDirectRDMAWritesScope scope) = NULL;
+static CUresult (*nccl_net_ofi_cuFlushGPUDirectRDMAWrites)(CUflushGPUDirectRDMAWritesTarget target,
+							   CUflushGPUDirectRDMAWritesScope scope) = NULL;
 #else
 void *nccl_net_ofi_cuFlushGPUDirectRDMAWrites = NULL;
+#endif
+
+int nccl_net_ofi_gpuDriverGetVersion(int *driverVersion) {
+	return nccl_net_ofi_cuDriverGetVersion(driverVersion) == CUDA_SUCCESS ? GPU_SUCCESS : GPU_ERROR;
+}
+
+int nccl_net_ofi_gpuCtxGetDevice(int *device) {
+	return nccl_net_ofi_cuCtxGetDevice((CUdevice *)device)  == CUDA_SUCCESS ? GPU_SUCCESS : GPU_ERROR;
+}
+
+int nccl_net_ofi_gpuDeviceGetCount(int *count) {
+	return nccl_net_ofi_cuDeviceGetCount(count) == CUDA_SUCCESS ? GPU_SUCCESS : GPU_ERROR;
+}
+
+#if CUDA_VERSION >= 11030
+int nccl_net_ofi_gpuFlushGPUDirectRDMAWrites(CUflushGPUDirectRDMAWritesTarget target,
+					              CUflushGPUDirectRDMAWritesScope scope) {
+	return nccl_net_ofi_cuFlushGPUDirectRDMAWrites(target, scope) == CUDA_SUCCESS ? GPU_SUCCESS : GPU_ERROR;
+}
 #endif
 
 #define STRINGIFY(sym) # sym
@@ -34,7 +53,7 @@ void *nccl_net_ofi_cuFlushGPUDirectRDMAWrites = NULL;
 	}								\
 
 int
-nccl_net_ofi_cuda_init(void)
+nccl_net_ofi_gpu_init(void)
 {
 	int ret = 0;
 	void *cudadriver_lib = NULL;
@@ -77,7 +96,7 @@ int nccl_net_ofi_get_cuda_device(void *data, int *dev_id)
 	CUresult cuda_ret_mem = nccl_net_ofi_cuPointerGetAttribute(&mem_type,
 								   CU_POINTER_ATTRIBUTE_MEMORY_TYPE,
 								   (CUdeviceptr) data);
-	CUresult cuda_ret_dev = nccl_net_ofi_cuPointerGetAttribute(&device_ordinal,	
+	CUresult cuda_ret_dev = nccl_net_ofi_cuPointerGetAttribute(&device_ordinal,
 								   CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL,
 								   (CUdeviceptr) data);
 
