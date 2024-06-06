@@ -93,7 +93,25 @@ CHECK_PKG_CUDA([have_device_interface=cuda])
 CHECK_PKG_ROCM([have_device_interface=rocm])
 
 AS_IF([test "${have_device_interface}" = "no"],
-      [AC_MSG_ERROR([NCCL OFI Plugin requires either CUDA or Neuron runtime.])])
+      [AC_MSG_ERROR([NCCL OFI Plugin requires either CUDA, ROCm or Neuron runtime.])])
+
+do_cuda=0
+do_rocm=0
+AS_IF([test -n "$want_rocm"],
+	[AS_IF([test "$have_device_interface" = "rocm"],
+		[enable_tests="no"
+		 do_rocm=1
+		 ])],
+	[AS_IF([test -n "$want_cuda"]
+		[do_cuda=1])])
+
+AC_DEFINE_UNQUOTED([HAVE_CUDA], [${do_cuda}], [Defined to 1 if CUDA is available])
+AM_CONDITIONAL([HAVE_CUDA], [test "${do_cuda}" = "1"])
+
+AC_DEFINE_UNQUOTED([HAVE_ROCM], [${do_rocm}], [Defined to 1 if ROCm is available])
+AM_CONDITIONAL([HAVE_ROCM], [test "${do_rocm}" = "1"])
+AS_IF([test "x$do_rocm" = "x1"],
+	AC_DEFINE_UNQUOTED( [__HIP_PLATFORM_AMD__], [ 1 ], [Select AMD/ROCm HIP APIs] ))
 
 CHECK_PKG_HWLOC([],
 		[AC_MSG_ERROR([Could not find the hwloc library. Use --with-hwloc to provide the path to non-standard hwloc installation.])])

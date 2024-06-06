@@ -14,6 +14,8 @@
 #include "nccl_ofi.h"
 #if HAVE_CUDA
 #include "nccl_ofi_cuda.h"
+#elif HAVE_ROCM
+#include "nccl_ofi_rocm.h"
 #endif
 #include "nccl_ofi_param.h"
 #include "nccl_ofi_rdma.h"
@@ -423,7 +425,7 @@ static int set_mr_req_attr(nccl_ofi_idpool_t *key_pool, int dev_id,
 		mr_attr->access |= FI_READ;
 		mr_attr->iface = FI_HMEM_SYSTEM;
 		break;
-#if HAVE_CUDA
+#if HAVE_CUDA || HAVE_ROCM
 	case NCCL_PTR_CUDA:
 		mr_attr->access |= FI_REMOTE_READ;
 		mr_attr->iface = FI_HMEM_CUDA;
@@ -3261,7 +3263,7 @@ static int flush(nccl_net_ofi_recv_comm_t *recv_comm, int n, void **buffers,
 
 #if CUDA_VERSION >= 11030
 	if (cuda_flush) {
-		CUresult cuda_ret = nccl_net_ofi_gpuFlushGPUDirectRDMAWrites(
+		int cuda_ret = nccl_net_ofi_gpuFlushGPUDirectRDMAWrites(
 			CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TARGET_CURRENT_CTX,
 			CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TO_OWNER);
 
