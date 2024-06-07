@@ -90,6 +90,7 @@ CHECK_PKG_NEURON([AS_IF([test -n "${want_cuda}"],
                         [want_cuda=no])
                   have_device_interface=neuron])
 CHECK_PKG_CUDA([have_device_interface=cuda])
+CHECK_PKG_ROCM([have_device_interface=rocm])
 
 AS_IF([test "${have_device_interface}" = "no"],
       [AC_MSG_ERROR([NCCL OFI Plugin requires either CUDA or Neuron runtime.])])
