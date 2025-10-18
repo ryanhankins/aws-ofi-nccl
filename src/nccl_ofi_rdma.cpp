@@ -1100,7 +1100,7 @@ static inline int handle_flush_comp(nccl_net_ofi_rdma_req_t *req)
 	ret = inc_req_completion(req, 0, flush_data->total_num_compls);
 #endif
 
-#if HAVE_CUDA
+#if HAVE_GPU
 
 	int num_completions = ++(req->ncompls);
 	/* Check if the number of completions is equal to total completions
@@ -3244,7 +3244,7 @@ int nccl_net_ofi_rdma_domain_t::dealloc_and_dereg_flush_buff()
 int nccl_net_ofi_rdma_domain_t::alloc_and_reg_flush_buff(int dev_id)
 {
 	int ret = 0;
-	int rc;
+	//int rc;
 	nccl_net_ofi_rdma_mr_handle_t *mr_handle = NULL;
 
 #if HAVE_NEURON
@@ -5360,14 +5360,14 @@ static int post_flush_req(nccl_net_ofi_rdma_req_t *req)
 {
  	nccl_net_ofi_rdma_recv_comm_t *r_comm = (nccl_net_ofi_rdma_recv_comm_t *)req->comm;
 	nccl_net_ofi_rdma_ep_t *ep = (nccl_net_ofi_rdma_ep_t *)r_comm->base.base.ep;
-	nccl_net_ofi_rdma_domain_t *domain = ep->rdma_endpoint_get_domain();
-	rdma_req_flush_data_t *flush_data = get_flush_data(req);
-	nccl_net_ofi_rdma_recv_comm_rail_t *comm_rail;
+	//nccl_net_ofi_rdma_domain_t *domain = ep->rdma_endpoint_get_domain();
+	//rdma_req_flush_data_t *flush_data = get_flush_data(req);
+	//nccl_net_ofi_rdma_recv_comm_rail_t *comm_rail;
 	ssize_t rc = 0;
 
 	/* iterate all rails and post RDMA local read */
 	for (uint16_t rail_id = 0; rail_id < ep->num_rails; rail_id++) {
-		comm_rail = rdma_recv_comm_get_rail(r_comm, rail_id);
+		//comm_rail = rdma_recv_comm_get_rail(r_comm, rail_id);
 		struct fid_mr *mr_handle = NULL;
 
 #if HAVE_NEURON
