@@ -206,7 +206,7 @@ private:
 
 public:
 	/* Manages registered connect-message buffers */
-	conn_msg_buffer_manager buff_mgr;
+	std::unique_ptr<conn_msg_buffer_manager> buff_mgr;
 
 	/**
 	 * Map from ID to callback functions for connect (resp) msg rx events.

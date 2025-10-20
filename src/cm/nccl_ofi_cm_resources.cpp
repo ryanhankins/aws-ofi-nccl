@@ -125,7 +125,7 @@ int pending_requests_queue::process_pending_reqs()
 cm_resources::cm_resources(nccl_net_ofi_domain_t &domain, size_t _conn_msg_data_size) :
 	ep(domain),
 	conn_msg_data_size(_conn_msg_data_size),
-	buff_mgr(ep, get_conn_msg_size()),
+	buff_mgr(new conn_msg_buffer_manager(ep, get_conn_msg_size())),
 	callback_map(),
 	pending_reqs_queue(),
 	next_connector_id(0),
@@ -152,19 +152,19 @@ cm_resources::cm_resources(nccl_net_ofi_domain_t &domain, size_t _conn_msg_data_
 
 cm_resources::~cm_resources()
 {
-	/* Resources can be destructed in the usual reverse-order, with one exception:
-	   The endpoint must be closed first, since posted buffers and requests cannot
-	   be freed until the endpoint is closed.
-	 */
-	ep.close_ofi_ep();
-
-	/* Free all requests. (A unique_ptr would be better here so these can be freed
-	   automatically) */
+	/* Free all requests first - they may hold references to buffers from buff_mgr */
 	for (auto &req : rx_reqs) {
 		delete req;
 		req = nullptr;
 	}
 	rx_reqs.clear();
+
+	/* Free buff_mgr - this will deregister MRs, which must happen before
+	   the endpoint is closed */
+	buff_mgr.reset();
+
+	/* Now close the endpoint */
+	ep.close_ofi_ep();
 }
 
 #define MR_KEY_INIT_VALUE FI_KEY_NOTAVAIL
