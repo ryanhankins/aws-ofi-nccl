@@ -31,6 +31,7 @@
 #include "nccl_ofi.h"
 #include "nccl_ofi_platform.h"
 #include "platform-aws.h"
+#include "nccl_ofi_environ.h"
 #include "nccl_ofi_log.h"
 #include "nccl_ofi_math.h"
 #include "nccl_ofi_rdma.h"
@@ -44,8 +45,40 @@
  * name is evaluated as a POSIX regex, so entries like "p5.*" is
  * valid.  First match found wins, even if there is a more specific
  * match later in the array.
+ *
+ * Notes on the environment:
+ *
+ *  * Certain GPU architectures do not require a network flush, but
+ *    NCCL versions <2.19.1 still enable flush by default on any
+ *    GPU type.  For GPU generations earlier than Hopper, NCCL
+ *    always enables flush, while for Hopper GPUs flush is enabled
+ *    or disabled depending on the value of the
+ *    NCCL_NET_FORCE_FLUSH environment variable. The default value
+ *    for this variable is 1 for NCCL versions <2.19.1, which
+ *    forces flush when it is not needed, so it is safe to set it
+ *    to 0 if it is not explicitly set.
+ *
+ *  * NCCL v2.19.3 reduced the chunk size used when running NVLS Tree
+ *    algorithm on greater than 4 nodes to 64KiB. This drastically impacted
+ *    performance on AWS (Ref: https://github.com/NVIDIA/nccl/pull/1112/
+ *    for some data). NCCL v2.20.3 has made this a tunable. Based on
+ *    empirical testing, a max chunk size of 512KiB recovers from the
+ *    regression and was also observed to be the default in v2.19.3.
+ *    Setting this unconditionally without relying on ncclGetVersion symbol
+ *    being available, since the parameter did not exist in versions prior
+ *    to v2.20.
+ *
+ *    The NVLSTree chunk size can not be larger than the NVLS chunk size,
+ *    so we ensure both are set to 512KiB.
+ *
+ *  * NCCL v2.28.3 introduced NCCL_NETDEVS_POLICY to control how NET devices
+ *    are assigned to GPUs. In platforms having multiple GPUs and NICs per
+ *    PCIe switch, setting this policy will change the traffic distribution
+ *    across the NICs, depending on the collective type as well as other
+ *    factors. (Currently AllToAll 0x7 is affected in NCCL v2.28.3.) Thus,
+ *    the best policy setting may vary per platform.
  */
-static struct ec2_platform_data platform_data_map[] = {
+const PlatformAWS::ec2_platform_data PlatformAWS::platform_data_map[] = {
 	{
 		.name = "p4d.24xlarge",
 		.regex = NULL,
@@ -53,9 +86,12 @@ static struct ec2_platform_data platform_data_map[] = {
 		.default_dup_conns = 0,
 		.latency = 75.0,
 		.gdr_required = true,
-		.net_flush_required = true,
-		.default_protocol = "SENDRECV",
-		.domain_per_thread = 0,
+		.default_protocol = PROTOCOL::SENDRECV,
+		.domain_per_thread = true,
+		.env = {
+			{ "NCCL_BUFFSIZE", "8388608" },
+			{ "NCCL_P2P_NET_CHUNKSIZE", "524288" },
+		},
 	},
 	{
 		.name = "p4de.24xlarge",
@@ -64,9 +100,12 @@ static struct ec2_platform_data platform_data_map[] = {
 		.default_dup_conns = 0,
 		.latency = 75.0,
 		.gdr_required = true,
-		.net_flush_required = true,
-		.default_protocol = "SENDRECV",
-		.domain_per_thread = 0,
+		.default_protocol = PROTOCOL::SENDRECV,
+		.domain_per_thread = true,
+		.env = {
+			{ "NCCL_BUFFSIZE", "8388608" },
+			{ "NCCL_P2P_NET_CHUNKSIZE", "524288" },
+		},
 	},
 	{
 		.name = "p3dn.24xlarge",
@@ -75,25 +114,88 @@ static struct ec2_platform_data platform_data_map[] = {
 		.default_dup_conns = 4,
 		.latency = 150.0,
 		.gdr_required = false,
-		.net_flush_required = true,
-		.default_protocol = "SENDRECV",
-		.domain_per_thread = 0,
+		.default_protocol = PROTOCOL::SENDRECV,
+		.domain_per_thread = true,
+		.env = {},
 	},
 	{
-		.name = "p-series",
-		/*
-		 * we only want to match P5 and later, as earlier
-		 * platforms all either need to be ignored or special
-		 * cased.
-		 */
-		.regex = "^p([5-9]|[0-9]{2,}).*",
+		.name = "p5.4xlarge",
+		.regex = NULL,
+		.topology = NULL,
+		.default_dup_conns = 0,
+		.latency = 75.0,
+		.gdr_required = false,
+		.default_protocol = PROTOCOL::SENDRECV,
+		.domain_per_thread = true,
+		.env = {},
+	},
+	{
+		.name = "p5/p5e",
+		.regex = "^p5(e?\\..*)",
 		.topology = NULL,
 		.default_dup_conns = 0,
 		.latency = 75.0,
 		.gdr_required = true,
-		.net_flush_required = false,
-		.default_protocol = "RDMA",
-		.domain_per_thread = 0,
+		.default_protocol = PROTOCOL::RDMA,
+		.domain_per_thread = true,
+		.env = {
+			{ "NCCL_BUFFSIZE", "8388608" },
+			{ "NCCL_P2P_NET_CHUNKSIZE", "524288" },
+			{ "NCCL_NVLSTREE_MAX_CHUNKSIZE", "524288" },
+			{ "NCCL_NVLS_CHUNKSIZE", "524288" },
+			{ "NCCL_NET_FORCE_FLUSH", "0" },
+		},
+	},
+	{
+		.name = "p5en/p6-b200",
+		.regex = "^(p5en|p6-b200).*",
+		.topology = NULL,
+		.default_dup_conns = 0,
+		.latency = 35.0,
+		.gdr_required = true,
+		.default_protocol = PROTOCOL::RDMA,
+		.domain_per_thread = true,
+		/*
+		 * Note: Based on empirical testing, setting the
+		 * NCCL_NETDEVS_POLICY=max:1 gives optimal performance
+		 * on platforms with 2 GPUs and 2 NICs per PCIe switch,
+		 * such as P5en and P6-B200.
+		 */
+		.env = {
+			{ "NCCL_BUFFSIZE", "8388608" },
+			{ "NCCL_P2P_NET_CHUNKSIZE", "524288" },
+			{ "NCCL_NVLSTREE_MAX_CHUNKSIZE", "524288" },
+			{ "NCCL_NVLS_CHUNKSIZE", "524288" },
+			{ "NCCL_NET_FORCE_FLUSH", "0" },
+			{ "NCCL_NETDEVS_POLICY", "max:1" },
+		},
+	},
+	{
+		.name = "p-series",
+		/*
+		 * While the regex will match against P5 and later
+		 * instance families, we expect this to apply to
+		 * P6e-GB200 and later, due to previous entries to
+		 * match P5, P5e, P5en, and P6-B200.
+		 *
+		 * Note: Need to revisit NCCL_NETDEVS_POLICY when
+		 * platforms have different topology or major
+		 * hardware changes.
+		 */
+		.regex = "^p([5-9]|[0-9]{2,}).*",
+		.topology = NULL,
+		.default_dup_conns = 0,
+		.latency = 35.0,
+		.gdr_required = true,
+		.default_protocol = PROTOCOL::RDMA,
+		.domain_per_thread = true,
+		.env = {
+			{ "NCCL_BUFFSIZE", "8388608" },
+			{ "NCCL_P2P_NET_CHUNKSIZE", "524288" },
+			{ "NCCL_NVLSTREE_MAX_CHUNKSIZE", "524288" },
+			{ "NCCL_NVLS_CHUNKSIZE", "524288" },
+			{ "NCCL_NET_FORCE_FLUSH", "0" },
+		},
 	},
 	{
 		.name = "g5.48xlarge",
@@ -102,9 +204,9 @@ static struct ec2_platform_data platform_data_map[] = {
 		.default_dup_conns = 0,
 		.latency = 75.0,
 		.gdr_required = false,
-		.net_flush_required = true,
-		.default_protocol = "SENDRECV",
-		.domain_per_thread = 0,
+		.default_protocol = PROTOCOL::SENDRECV,
+		.domain_per_thread = true,
+		.env = {},
 	},
 	{
 		.name = "trn1",
@@ -113,9 +215,9 @@ static struct ec2_platform_data platform_data_map[] = {
 		.default_dup_conns = 0,
 		.latency = 75.0,
 		.gdr_required = true,
-		.net_flush_required = true,
-		.default_protocol = "SENDRECV",
-		.domain_per_thread = 1,
+		.default_protocol = PROTOCOL::SENDRECV,
+		.domain_per_thread = true,
+		.env = {},
 	},
 	{
 		.name = "trn2",
@@ -124,9 +226,9 @@ static struct ec2_platform_data platform_data_map[] = {
 		.default_dup_conns = 0,
 		.latency = 75.0,
 		.gdr_required = true,
-		.net_flush_required = true,
-		.default_protocol = "RDMA",
-		.domain_per_thread = 1,
+		.default_protocol = PROTOCOL::RDMA,
+		.domain_per_thread = true,
+		.env = {},
 	},
 	{
 		.name = "inf",
@@ -135,20 +237,18 @@ static struct ec2_platform_data platform_data_map[] = {
 		.default_dup_conns = 0,
 		.latency = 75.0,
 		.gdr_required = true,
-		.net_flush_required = true,
-		.default_protocol = "SENDRECV",
-		.domain_per_thread = 1,
+		.default_protocol = PROTOCOL::SENDRECV,
+		.domain_per_thread = true,
+		.env = {},
 	},
 };
+
 
 /*
  * We need to cache the fields that we grabbed for each device so we don't go
  * read sysfs for each field that we need.
  */
-static std::unordered_map<std::string, struct platform_aws_node_guid> guid_cache;
-static std::mutex cache_mutex;
-
-struct ec2_platform_data *platform_aws_get_platform_map(size_t *len)
+const PlatformAWS::ec2_platform_data *PlatformAWS::get_platform_map(size_t *len) const
 {
 	*len = sizeof(platform_data_map)/sizeof(platform_data_map[0]);
 	return platform_data_map;
@@ -156,16 +256,15 @@ struct ec2_platform_data *platform_aws_get_platform_map(size_t *len)
 
 
 /*
- * internal function (exported for unit test purposes) for finding the
- * correct platform data entry.  You should use
- * platform_Aws_get_platform_data() so that you get caching and all
- * that niceness.
+ * Protected function for finding the correct platform data entry.
+ * You should use PlatformAWS::get_platform_data() so that you get caching
+ * and all that niceness.
  */
-struct ec2_platform_data *platform_aws_get_platform_entry(const char *platform_type,
-							  struct ec2_platform_data *platform_data_list,
+const PlatformAWS::ec2_platform_data *PlatformAWS::get_platform_entry(const char *platform_type,
+							  const PlatformAWS::ec2_platform_data *platform_data_list,
 							  size_t platform_data_len)
 {
-	struct ec2_platform_data *response = NULL;
+	const PlatformAWS::ec2_platform_data *response = NULL;
 	regex_t regex;
 	int ret;
 
@@ -214,39 +313,30 @@ done:
  * @return	NULL, if no entry found
  * 		platform data, if match found
  */
-static struct ec2_platform_data *get_platform_data(void)
+const PlatformAWS::ec2_platform_data *PlatformAWS::get_platform_data()
 {
-	static bool init = false;
-	static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
-	static struct ec2_platform_data *platform_data = NULL;
-	const char* platform_type = NULL;
-	struct ec2_platform_data *platform_data_list;
-	size_t platform_data_len;
+	std::lock_guard<std::mutex> lock(mutex_);
 
-	nccl_net_ofi_mutex_lock(&mutex);
-
-	if (init) {
-		goto done;
+	if (platform_data_init_) {
+		return cached_platform_data_;
 	}
-	init = true;
 
-	platform_type = nccl_net_ofi_get_product_name();
+	platform_data_init_ = true;
+
+	const char* platform_type = nccl_net_ofi_get_product_name();
 	if (platform_type == NULL) {
-		goto done;
+		return cached_platform_data_;
 	}
 
-	platform_data_list = platform_aws_get_platform_map(&platform_data_len);
+	const PlatformAWS::ec2_platform_data *platform_data_list;
+	size_t platform_data_len;
+	platform_data_list = get_platform_map(&platform_data_len);
 	if (platform_data_list == NULL) {
-		goto done;
+		return cached_platform_data_;
 	}
 
-	platform_data = platform_aws_get_platform_entry(platform_type, platform_data_list,
-							platform_data_len);
-
-done:
-	nccl_net_ofi_mutex_unlock(&mutex);
-
-	return platform_data;
+	cached_platform_data_ = get_platform_entry(platform_type, platform_data_list, platform_data_len);
+	return cached_platform_data_;
 }
 
 
@@ -254,7 +344,7 @@ done:
  * validate that EFA is using RDMA write natively and not in an
  * emulated fasion.
  */
-static int validate_rdma_write(struct fid_ep *ep)
+int PlatformAWS::validate_rdma_write(struct fid_ep *ep)
 {
 	int ret = 0;
 #if HAVE_DECL_FI_OPT_EFA_EMULATED_WRITE
@@ -265,31 +355,29 @@ static int validate_rdma_write(struct fid_ep *ep)
 	if (ret != 0) {
 		NCCL_OFI_WARN("Couldn't get FI_OPT_EFA_EMULATED_WRITE. RC: %d, ERROR: %s",
 			      ret, fi_strerror(-ret));
-		goto exit;
+		return ret;
 	} else if (optlen != sizeof(optval)) {
 		NCCL_OFI_WARN("Unexpected response size when checking FI_OPT_EFA_EMULATED_WRITE.  Expected %lu, got %lu",
 			      sizeof(optval), optlen);
 		ret = -EINVAL;
-		goto exit;
+		return ret;
 	} else if (optval) {
 		NCCL_OFI_WARN("FI_OPT_EFA_EMULATED_WRITE is true when the communication protocol is RDMA write.");
 		ret = -EINVAL;
-		goto exit;
+		return ret;
 	}
 	NCCL_OFI_TRACE(NCCL_INIT | NCCL_NET, "Get endpoint option FI_OPT_EFA_EMULATED_WRITE. optval: %d",
 		       optval);
 #else
 	NCCL_OFI_WARN("FI_OPT_EFA_EMULATED_WRITE not declared when the communication protocol is RDMA write.");
 	ret = -EINVAL;
-	goto exit;
 #endif
 
-exit:
 	return ret;
 }
 
 
-#if HAVE_CUDA
+#if HAVE_GPU
 /*
  * Try to set one of the in-order flags for either send/recv or rdma
  * on the current endpoint to true.  have_ordering will be the
@@ -298,7 +386,7 @@ exit:
  * Returns 0 on success (ie, have_ordering is in a sane state) or
  * -error code on unexpected failure.
  */
-static int configure_ep_inorder(struct fid_ep *ep, int optname, const char* optname_name,
+int PlatformAWS::configure_ep_inorder(struct fid_ep *ep, int optname, const char* optname_name,
 				bool *have_ordering)
 {
 #if HAVE_DECL_FI_OPT_EFA_WRITE_IN_ORDER_ALIGNED_128_BYTES
@@ -335,14 +423,13 @@ static int configure_ep_inorder(struct fid_ep *ep, int optname, const char* optn
  *
  * Returns 0 on success or -error code on unexpected failure.
  */
-static int configure_ep_max_msg_size(struct fid_ep *ep)
+int PlatformAWS::configure_ep_max_msg_size(struct fid_ep *ep)
 {
 	int ret = 0;
 
 #if HAVE_DECL_FI_OPT_MAX_MSG_SIZE
 	ssize_t eager_max_size = (ssize_t)ofi_nccl_eager_max_size();
-	size_t optval = std::max(sizeof(nccl_net_ofi_rdma_ctrl_msg_t),
-				 sizeof(nccl_ofi_rdma_connection_info_t));
+	size_t optval = sizeof(nccl_ofi_rdma_connection_info_t);
 
 	if (eager_max_size > 0) {
 		optval = std::max(optval, static_cast<size_t>(eager_max_size));
@@ -366,7 +453,7 @@ static int configure_ep_max_msg_size(struct fid_ep *ep)
 
 typedef ncclResult_t (*nccl_get_version_fn_t)(int *version);
 
-static int configure_nvls_option(void)
+int PlatformAWS::configure_nvls_option()
 {
 	/* Disable NVLS topology discovery for older NCCL versions. There's a
 	 * bug with EFA and NCCL version 2.18.3 and earlier on platforms with
@@ -376,7 +463,6 @@ static int configure_nvls_option(void)
 	nccl_get_version_fn_t nccl_get_version = NULL;
 	int version = 0;
 	ncclResult_t nccl_ret;
-	int ret;
 
 	if (getenv("NCCL_NVLS_ENABLE") == NULL) {
 		nccl_get_version = (nccl_get_version_fn_t)dlsym(RTLD_DEFAULT, "ncclGetVersion");
@@ -397,11 +483,7 @@ static int configure_nvls_option(void)
 		/* 2.18.5 */
 		if (version < 21805) {
 			NCCL_OFI_INFO(NCCL_INIT | NCCL_NET, "Disabling NVLS support due to NCCL version %d", version);
-			ret = setenv("NCCL_NVLS_ENABLE", "0", 1);
-			if (ret != 0) {
-				NCCL_OFI_WARN("Unable to set NCCL_NVLS_ENABLE");
-				return -errno;
-			}
+			env_manager::getInstance().insert_envvar("NCCL_NVLS_ENABLE", "0", false);
 		} else {
 			NCCL_OFI_TRACE(NCCL_INIT | NCCL_NET, "Not disabling NVLS support due to NCCL version %d", version);
 		}
@@ -410,7 +492,70 @@ static int configure_nvls_option(void)
 	return 0;
 }
 
-#endif /* HAVE_CUDA */
+int PlatformAWS::configure_tuner()
+{
+	// NCCL has a bug in their handling of the combined net/tuner dso (at
+	// least up to NCCL 2.27) where the tuner init does not open the net
+	// shared library but later tries to close it, meaning that the shared
+	// library gets closed and potentially unloaded from memory before NCCL
+	// is done using the net part of the interface, which results in obvious
+	// badness.
+	//
+	// If NCCL_TUNER_PLUGIN is set, NCCL will dlopen() the library whether
+	// or not it is the same underlying library as the NET plugin, meaning
+	// that we get the reference counting behavior we need.  So attempt to
+	// always set NCCL_TUNER_PLUGIN to prevent the dlopen refcount bug.
+	//
+	// When this bug is fixed, we should use the next api version bump as a
+	// way of shutting off this code.
+	if (getenv("NCCL_TUNER_PLUGIN") != NULL) {
+		NCCL_OFI_TRACE(NCCL_INIT | NCCL_NET,
+			       "NCCL_TUNER_PLUGIN set; skipping configuration");
+		return 0;
+	}
+
+	// if we know how the net plugin was found, use that value for the tuner
+	// plugin.  Skip the case where a list is provide, because parsing the
+	// list does not sound like a winning strategy and the only version of
+	// NCCL that currently supports a comma delineated list also doesn't
+	// support specifying full paths (meaning that the dladdr code below
+	// will work fine).
+	char *env_net_value = getenv("NCCL_NET_PLUGIN");
+	if (env_net_value != NULL && strchr(env_net_value, ',') == NULL) {
+		env_manager::getInstance().insert_envvar("NCCL_TUNER_PLUGIN", env_net_value, false);
+		return 0;
+	}
+
+	// NCCL found the net plugin without setting NCCL_NET_PLUGIN.  Need to
+	// figure out where we came from.
+	Dl_info info;
+	int rc = dladdr((void *)&PlatformAWS::get_platform_entry, &info);
+	if (rc != 0) {
+		// unlike every other call, rc == 0 is the error condition for
+		// dladdr().
+		//
+		// NCCL 2.27 NCCL_TUNER_PLUGIN must be just the basename, without a path.
+		const std::string net_pathname(info.dli_fname);
+		auto const pos = net_pathname.find_last_of('/');
+		if (pos == std::string::npos) {
+			NCCL_OFI_WARN("Failed to parse shared library info.  Not configuring NCCL_TUNER_PLUGIN.");
+			return -EINVAL;
+		}
+		const auto net_basename = net_pathname.substr(pos + 1);
+
+		env_manager::getInstance().insert_envvar("NCCL_TUNER_PLUGIN", net_basename, false);
+	} else {
+		NCCL_OFI_WARN("Failed to find shared library info. Not configuring NCCL_TUNER_PLUGIN.");
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+
+
+
+#endif /* HAVE_GPU */
 
 /*
  * @brief	Update NCCL's system topology using static pre-configured topology
@@ -420,10 +565,10 @@ static int configure_nvls_option(void)
  * 		   if we find no match
  * 		error, on failure
  */
-int platform_init(const char **provider_filter)
+int PlatformAWS::init(const char **provider_filter)
 {
 	int ret = ncclSuccess;
-	struct ec2_platform_data *platform_data;
+	const PlatformAWS::ec2_platform_data *platform_data;
 	bool select_efa = false;
 	char *fi_provider;
 
@@ -444,6 +589,20 @@ int platform_init(const char **provider_filter)
 		select_efa = true;
 	} else if (0 == strcmp(fi_provider, "efa")) {
 		select_efa = true;
+	}
+
+	/*
+	 * For p6e-gb200 platforms we want to skip nics which do not
+	 * have an accelerator at the same PCI level
+	 */
+	if ((strncmp(nccl_net_ofi_get_product_name(), PLATFORM_NAME_P6E_GB200,
+		strlen(PLATFORM_NAME_P6E_GB200)) == 0) &&
+		ofi_nccl_skip_nics_without_accel.get_source() == ParamSource::DEFAULT) {
+		ofi_nccl_skip_nics_without_accel.set(true);
+	}
+
+	if (platform_data != NULL) {
+		env_manager::getInstance().insert_envvars(platform_data->env);
 	}
 
 #if HAVE_CUDA
@@ -479,74 +638,18 @@ int platform_init(const char **provider_filter)
 		(FI_MAJOR(libversion) > 1 || (FI_MAJOR(libversion) == 1 && FI_MINOR(libversion) >= 13))
 		? "FI_EFA_FORK_SAFE"
 		: "RDMAV_FORK_SAFE";
-	if (!getenv(fork_safe_var_name)) {
-		NCCL_OFI_INFO(NCCL_INIT, "Setting %s environment variable to 1", fork_safe_var_name);
-		ret = setenv(fork_safe_var_name, "1", 1);
-		if (ret != 0) {
-			NCCL_OFI_WARN("Unable to set %s", fork_safe_var_name);
-			ret = -errno;
-			goto exit;
-		}
-	}
+	env_manager::getInstance().insert_envvar(fork_safe_var_name, "1", false);
 
 	ret = configure_nvls_option();
 	if (ret != 0) {
 		NCCL_OFI_WARN("Unable to configure NVLS option");
-		goto exit;
+		return ret;
 	}
 
-	if ((platform_data && !platform_data->net_flush_required) &&
-	    NULL == getenv("NCCL_NET_FORCE_FLUSH")) {
-
-		/*
-		 * Certain GPU architectures do not require a network flush, but
-		 * NCCL versions <2.19.1 still enable flush by default on any
-		 * GPU type.  For GPU generations earlier than Hopper, NCCL
-		 * always enables flush, while for Hopper GPUs flush is enabled
-		 * or disabled depending on the value of the
-		 * NCCL_NET_FORCE_FLUSH environment variable. The default value
-		 * for this variable is 1 for NCCL versions <2.19.1, which
-		 * forces flush when it is not needed, so it is safe to set it
-		 * to 0 if it is not explicitly set.
-		 */
-
-		NCCL_OFI_INFO(NCCL_INIT | NCCL_NET, "Setting NCCL_NET_FORCE_FLUSH=0 since this platform does not require a network flush.");
-		ret = setenv("NCCL_NET_FORCE_FLUSH", "0", 0);
-		if (ret != 0) {
-			NCCL_OFI_WARN("Unable to set NCCL_NET_FORCE_FLUSH");
-			ret = -errno;
-			goto exit;
-		}
-	}
-
-	/*
-	 * NCCL v2.19.3 reduced the chunk size used when running NVLS Tree
-	 * algorithm on greater than 4 nodes to 64KiB. This drastically impacted
-	 * performance on AWS (Ref: https://github.com/NVIDIA/nccl/pull/1112/
-	 * for some data). NCCL v2.20.3 has made this a tunable. Based on
-	 * empirical testing, a max chunk size of 512KiB recovers from the
-	 * regression and was also observed to be the default in v2.19.3.
-	 * Setting this unconditionally without relying on ncclGetVersion symbol
-	 * being available, since the parameter did not exist in versions prior
-	 * to v2.20.
-	 *
-	 * The NVLSTree chunk size can not be larger than the NVLS chunk size,
-	 * so we ensure both are set to 512KiB.
-	 */
-	NCCL_OFI_INFO(NCCL_INIT | NCCL_NET, "Setting NCCL_NVLSTREE_MAX_CHUNKSIZE to 512KiB");
-	ret = setenv("NCCL_NVLSTREE_MAX_CHUNKSIZE", "524288", 0);
+	ret = configure_tuner();
 	if (ret != 0) {
-		NCCL_OFI_WARN("Unable to set NCCL_NVLSTREE_MAX_CHUNKSIZE");
-		ret = -errno;
-		goto exit;
-	}
-
-	NCCL_OFI_INFO(NCCL_INIT | NCCL_NET, "Setting NCCL_NVLS_CHUNKSIZE to 512KiB");
-	ret = setenv("NCCL_NVLS_CHUNKSIZE", "524288", 0);
-	if (ret != 0) {
-		NCCL_OFI_WARN("Unable to set NCCL_NVLS_CHUNKSIZE");
-		ret = -errno;
-		goto exit;
+		NCCL_OFI_WARN("Unable to configure tuner: %s", strerror(-ret));
+		return ret;
 	}
 #endif
 
@@ -567,28 +670,25 @@ int platform_init(const char **provider_filter)
 			NCCL_OFI_WARN("Error occurred while forming the complete topology XML file path. RC: %d, Buffer Size: %d, XML dir: %s, Topology file: %s",
 				      ret, PATH_MAX, XML_DIR, platform_data->topology);
 			ret = -ENOMEM;
-			goto exit;
+			return ret;
 		}
+		ret = 0;
 
 		NCCL_OFI_INFO(NCCL_INIT | NCCL_NET,
-				"Running on %s platform, Setting NCCL_TOPO_FILE environment variable to %s",
+				"Running on %s platform, topology file %s",
 				nccl_net_ofi_get_product_name(), topology_path);
 
-		ret = setenv("NCCL_TOPO_FILE", topology_path, 1);
-		if (ret != 0) {
-			NCCL_OFI_WARN("Unable to set NCCL_TOPO_FILE");
-			ret = -errno;
-			goto exit;
-		}
-
+		env_manager::getInstance().insert_envvar("NCCL_TOPO_FILE", topology_path, false);
 	}
 
-	if (nic_dup_conns == 0 && platform_data)
-		nic_dup_conns = platform_data->default_dup_conns;
+	if (ofi_nccl_nic_dup_conns.get_source() == ParamSource::DEFAULT &&
+	    platform_data != NULL) {
+		ofi_nccl_nic_dup_conns.set(platform_data->default_dup_conns);
+	}
 
-	if (ofi_nccl_net_latency() < 0) {
+	if (ofi_nccl_net_latency.get_source() == ParamSource::DEFAULT) {
 		if (platform_data && platform_data->latency >= 0.0) {
-			net_latency = platform_data->latency;
+			ofi_nccl_net_latency.set(platform_data->latency);
 		} else {
 			/*
 			 * Empirical testing on P5 had shown that NCCL's
@@ -597,21 +697,25 @@ int platform_init(const char **provider_filter)
 			 * generations of EFA, using it as the fall-through
 			 * default for undefined platforms.
 			 */
-			net_latency = 75.0;
+			ofi_nccl_net_latency.set(75.0);
 		}
 		NCCL_OFI_INFO(NCCL_INIT | NCCL_NET, "Internode latency set at %.1f us",
-				net_latency);
+			      ofi_nccl_net_latency.get());
 	}
 
-	if (select_efa && ofi_nccl_protocol() == NULL && platform_data) {
-		nccl_ofi_selected_protocol = platform_data->default_protocol;
+	if (select_efa && ofi_nccl_protocol.get_source() == ParamSource::DEFAULT && platform_data) {
+		ofi_nccl_protocol.set(platform_data->default_protocol);
 	}
 
-exit:
+	if (ofi_nccl_domain_per_thread.get_source() == ParamSource::DEFAULT && platform_data) {
+		ofi_nccl_domain_per_thread.set(platform_data->domain_per_thread);
+	}
+
 	return ret;
 }
 
-int platform_config_endpoint(struct fi_info *info, struct fid_ep* endpoint) {
+int PlatformAWS::config_endpoint(struct fi_info *info, struct fid_ep* endpoint)
+{
 	int ret = 0;
 #if HAVE_CUDA
 	const char *optname_name = "none";
@@ -621,22 +725,22 @@ int platform_config_endpoint(struct fi_info *info, struct fid_ep* endpoint) {
 	if (endpoint == NULL) {
 		NCCL_OFI_WARN("Unable to configure invalid endpoint");
 		ret = -EINVAL;
-		goto exit;
+		return ret;
 	}
 
 	/* short circuit when not using EFA */
 	if (0 != strcmp(info->fabric_attr->prov_name, "efa")) {
 		ret = 0;
-		goto exit;
+		return ret;
 	}
 
 	if (ofi_nccl_disable_gdr_required_check() == 0) {
 		/* Ensure GDR is enabled on GDR-supported instances */
-		struct ec2_platform_data *platform_data = get_platform_data();
+		const PlatformAWS::ec2_platform_data *platform_data = get_platform_data();
 		if (platform_data && platform_data->gdr_required && support_gdr != GDR_SUPPORTED) {
 			NCCL_OFI_WARN("GDR disabled on GDR-supported instance type %s", platform_data->name);
 			ret = -EINVAL;
-			goto exit;
+			return ret;
 		}
 	}
 
@@ -646,43 +750,39 @@ int platform_config_endpoint(struct fi_info *info, struct fid_ep* endpoint) {
 	 * emulated writes are disabled.
 	 */
 
-	if (0 == strcasecmp("RDMA", nccl_ofi_selected_protocol) &&
+	if (ofi_nccl_protocol.get() == PROTOCOL::RDMA &&
 	    ofi_nccl_disable_native_rdma_check() == 0) {
 		ret = validate_rdma_write(endpoint);
 		if (ret != 0) {
-			goto exit;
+			return ret;
 		}
 	}
 
 #if HAVE_CUDA
-	static bool nccl_proto_configured = false;
-	static bool need_ordering = false;
-	static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+	std::lock_guard<std::mutex> lock(mutex_);
 
 	/* During initialization, try to set
-	 * FI_OPT_EFA_{SENDRECV,WRTIE}_IN_ORDER_ALIGNED_128_BYTES to
+	 * FI_OPT_EFA_{SENDRECV,WRITE}_IN_ORDER_ALIGNED_128_BYTES to
 	 * true to see if the LL/LL128 protocol is supported. After
 	 * initialization, try to set the option to true again if it
 	 * was previously set and error if we can't set them the same
 	 * way later.
 	 */
-	if (0 == strcasecmp("SENDRECV", nccl_ofi_selected_protocol)) {
+	if (ofi_nccl_protocol.get() == PROTOCOL::SENDRECV) {
 #if HAVE_DECL_FI_OPT_EFA_SENDRECV_IN_ORDER_ALIGNED_128_BYTES
 		optname = FI_OPT_EFA_SENDRECV_IN_ORDER_ALIGNED_128_BYTES;
 		optname_name = "FI_OPT_EFA_SENDRECV_IN_ORDER_ALIGNED_128_BYTES";
 #endif
-	} else if (0 == strcasecmp("RDMA", nccl_ofi_selected_protocol)) {
+	} else if (ofi_nccl_protocol.get() == PROTOCOL::RDMA) {
 #if HAVE_DECL_FI_OPT_EFA_WRITE_IN_ORDER_ALIGNED_128_BYTES
 		optname = FI_OPT_EFA_WRITE_IN_ORDER_ALIGNED_128_BYTES;
 		optname_name = "FI_OPT_EFA_WRITE_IN_ORDER_ALIGNED_128_BYTES";
 #endif
 	} else {
-		NCCL_OFI_WARN("unkonwn transport %s", nccl_ofi_selected_protocol);
+		NCCL_OFI_WARN("unknown transport %s", ofi_nccl_protocol.get_string());
 		ret = -EINVAL;
-		goto exit;
+		return ret;
 	}
-
-	nccl_net_ofi_mutex_lock(&mutex);
 
 	/* TODO: This is a temporary hack to disable setting
 	 * NCCL_PROTO=simple on P5en when using the RDMA protocol.  EFA
@@ -698,13 +798,13 @@ int platform_config_endpoint(struct fi_info *info, struct fid_ep* endpoint) {
 	 * SENDRECV_IN_ORDER_ALIGNED_128_BYTES flag, so we only skip
 	 * the check when using the RDMA protocol.
 	 */
-	if (!nccl_proto_configured) {
+	if (!nccl_proto_configured_) {
 		if ((NULL == getenv("NCCL_PROTO")) &&
-		    (0 == strcasecmp("RDMA", nccl_ofi_selected_protocol)) &&
+		    (ofi_nccl_protocol.get() == PROTOCOL::RDMA) &&
 		    (0 == strcmp(nccl_net_ofi_get_product_name(), "p5en.48xlarge"))) {
 			NCCL_OFI_INFO(NCCL_INIT, "Skipping NCCL_PROTO checks on P5en + RDMA");
-			need_ordering = false;
-			nccl_proto_configured = true;
+			need_ordering_ = false;
+			nccl_proto_configured_ = true;
 		}
 	}
 
@@ -717,7 +817,7 @@ int platform_config_endpoint(struct fi_info *info, struct fid_ep* endpoint) {
 	 * ordering.  If we're not expecting ordering, we don't really
 	 * care if ordering is on or off for the endpoint.
 	 */
-	if (need_ordering || !nccl_proto_configured) {
+	if (need_ordering_ || !nccl_proto_configured_) {
 		bool have_ordering = false;
 
 		if (optname != -1) {
@@ -725,20 +825,20 @@ int platform_config_endpoint(struct fi_info *info, struct fid_ep* endpoint) {
 						   &have_ordering);
 			if (ret != 0) {
 				NCCL_OFI_WARN("Unexpected failure setting inorder %d", ret);
-				goto unlock;
+				return ret;
 			}
 		}
 
-		if (need_ordering && !have_ordering) {
+		if (need_ordering_ && !have_ordering) {
 			NCCL_OFI_WARN("Setting %s option failed after succeeding during initialization",
 				      optname_name);
 			ret = -ENOTSUP;
-			goto unlock;
+			return ret;
 		}
 
-		if (!nccl_proto_configured) {
-			need_ordering = have_ordering;
-			nccl_proto_configured = true;
+		if (!nccl_proto_configured_) {
+			need_ordering_ = have_ordering;
+			nccl_proto_configured_ = true;
 
 			if (!have_ordering) {
 				/* When byte delivery ordering is not guaranteed, force
@@ -749,29 +849,25 @@ int platform_config_endpoint(struct fi_info *info, struct fid_ep* endpoint) {
 				if (ret != 0) {
 					NCCL_OFI_WARN("Failed to set NCCL_PROTO: %d", ret);
 					ret = -ENOTSUP;
-					goto unlock;
+					return ret;
 				}
 			}
 		}
 	}
 
-	if (0 == strcasecmp("RDMA", nccl_ofi_selected_protocol)) {
+	if (ofi_nccl_protocol.get() == PROTOCOL::RDMA) {
 		ret = configure_ep_max_msg_size(endpoint);
 		if (ret != 0) {
 			NCCL_OFI_WARN("Unexpected failure setting max_msg_size %d", ret);
-			goto unlock;
+			return ret;
 		}
 	}
-
-unlock:
-	nccl_net_ofi_mutex_unlock(&mutex);
 #endif // HAVE_CUDA
 
-exit:
 	return ret;
 }
 
-static const struct platform_aws_node_guid* get_node_guid_fields(struct fi_info *info)
+const PlatformAWS::platform_aws_node_guid* PlatformAWS::get_node_guid_fields(struct fi_info *info)
 {
 	if (!info->nic || !info->nic->device_attr || !info->nic->device_attr->name) {
 		NCCL_OFI_WARN("fi_nic attributes not available.");
@@ -782,9 +878,9 @@ static const struct platform_aws_node_guid* get_node_guid_fields(struct fi_info 
 
 	/* Check to see if we've already parsed the fields for this RDMA device */
 	{
-		std::lock_guard<std::mutex> lock(cache_mutex);
-		auto it = guid_cache.find(device_name);
-		if (it != guid_cache.end()) {
+		std::lock_guard<std::mutex> lock(mutex_);
+		auto it = guid_cache_.find(device_name);
+		if (it != guid_cache_.end()) {
 			return &(it->second);
 		}
 	}
@@ -825,7 +921,7 @@ static const struct platform_aws_node_guid* get_node_guid_fields(struct fi_info 
 	 * | func_mac_low_bytes | per_card_pci_domain | per_card_pci_bus |  func_idx  |
 	 * +--------------------+---------------------+------------------+------------+
 	 */
-	struct platform_aws_node_guid node_guid_fields;
+	PlatformAWS::platform_aws_node_guid node_guid_fields;
 	node_guid_fields.func_idx = raw_value & 0xFF;
 	node_guid_fields.per_card_pci_bus = (raw_value >> 8) & 0xFF;
 	node_guid_fields.per_card_pci_domain = (raw_value >> 16) & 0xFF;
@@ -833,25 +929,15 @@ static const struct platform_aws_node_guid* get_node_guid_fields(struct fi_info 
 
 	/* Stash in the guid fields cache */
 	{
-		std::lock_guard<std::mutex> lock(cache_mutex);
-		guid_cache[device_name] = node_guid_fields;
-		return &(guid_cache[device_name]);
+		std::lock_guard<std::mutex> lock(mutex_);
+		guid_cache_[device_name] = node_guid_fields;
+		return &(guid_cache_[device_name]);
 	}
 }
 
-static int get_rail_vf_idx(struct fi_info *info)
+void PlatformAWS::device_set_guid(struct fi_info *info, nccl_net_ofi_device_t *device)
 {
-	const struct platform_aws_node_guid* fields = get_node_guid_fields(info);
-	if (fields == nullptr) {
-		NCCL_OFI_WARN("Failed to get node GUID fields");
-		return -EIO;
-	}
-	return fields->func_idx;
-}
-
-void platform_device_set_guid(struct fi_info *info, struct nccl_net_ofi_device *device)
-{
-	const struct platform_aws_node_guid* fields = get_node_guid_fields(info);
+	const PlatformAWS::platform_aws_node_guid* fields = get_node_guid_fields(info);
 	uint32_t node_id = nccl_ofi_get_unique_node_id();
 
 	if (!fields ||
@@ -883,7 +969,7 @@ void platform_device_set_guid(struct fi_info *info, struct nccl_net_ofi_device *
  * that there is an alternating of the 0th pair index and then the 1st
  * pair index, and so on.
  */
-void platform_sort_rails(struct fi_info **info_list, size_t num_rails, size_t num_groups)
+void PlatformAWS::sort_rails(struct fi_info **info_list, size_t num_rails, size_t num_groups)
 {
 	struct fi_info **info_array = NULL;
 	struct fi_info *info_iter = NULL;
@@ -997,14 +1083,4 @@ cleanup:
 	}
 
 	return;
-}
-
-
-bool platform_default_domain_per_thread(void)
-{
-	struct ec2_platform_data *platform_data = get_platform_data();
-	if (platform_data != NULL && platform_data->domain_per_thread != 0) {
-		return true;
-	}
-	return false;
 }

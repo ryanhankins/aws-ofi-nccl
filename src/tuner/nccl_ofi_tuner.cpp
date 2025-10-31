@@ -4,6 +4,7 @@
 
 #include "config.h"
 
+#include <cassert>
 #include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -18,13 +19,13 @@
 #include "nccl_ofi_pthread.h"
 #include "nccl_ofi_system.h"
 #include "nccl_ofi_param.h"
+#include "nccl_ofi_platform.h"
 
 #include "tuner/nccl_ofi_tuner_region.h"
 #include "tuner/nccl_ofi_tuner_model.h"
 #include "tuner/nccl_ofi_tuner.h"
 
 pthread_mutex_t nccl_ofi_tuner_ctx_lock = PTHREAD_MUTEX_INITIALIZER;
-ncclDebugLogger_t ofi_log_function = NULL;
 
 static ncclResult_t nccl_ofi_tuner_destroy(void *context)
 {
@@ -46,7 +47,6 @@ static ncclResult_t nccl_ofi_tuner_destroy(void *context)
 static ncclResult_t nccl_ofi_tuner_init(size_t nRanks, size_t nNodes, ncclDebugLogger_t logFunction, void **context)
 {
 	const char *platform_type = NULL;
-	const char *tuner_force_type = NULL;
 	ncclResult_t ret = ncclSuccess;
 	*context = NULL;
 	nccl_ofi_tuner_context_t *ctx = NULL;
@@ -54,37 +54,68 @@ static ncclResult_t nccl_ofi_tuner_init(size_t nRanks, size_t nNodes, ncclDebugL
 	int is_force_type_model = 0;
 	enum nccl_ofi_tuner_platform tuner_platform;
 
-	ofi_log_function = logFunction;
+	if (ofi_log_function == NULL) {
+		ofi_log_function = logFunction;
+	}
 
 	nccl_net_ofi_mutex_lock(&nccl_ofi_tuner_ctx_lock);
+
+	/* Create topology for platform detection */
+	auto topo = nccl_ofi_topo_create();
+	PlatformManager::register_all_platforms(topo);
+	nccl_ofi_topo_free(topo);
 
 	/*
 	 * Retrieve platform type and pass to Region and Model based tuner support check functions.
 	 * If both Region and Model based tuner are not supported, log a warning and exit.
 	 */
-	platform_type = nccl_net_ofi_get_product_name();
+	auto platform_name = PlatformManager::get_global().get_platform().get_name();
+	NCCL_OFI_INFO(NCCL_INIT | NCCL_TUNING, "Tuner selected platform: %s", platform_name);
+	if (strcmp(platform_name, "AWS") == 0) {
+		platform_type = nccl_net_ofi_get_product_name();
+	}
+
+	/* Default platform or other non-AWS platforms should use internal tuner */
 	if (platform_type == NULL) {
-		NCCL_OFI_WARN("NCCL_OFI_TUNER is not available because platform type is unavailable.");
+		NCCL_OFI_INFO(NCCL_INIT | NCCL_TUNING,
+			"NCCL_OFI_TUNER is not available because platform type is unavailable.");
 		goto exit;
 	}
 
-	tuner_force_type = ofi_nccl_tuner_force_type();
-	if (tuner_force_type != NULL) {
-		if (strcmp(tuner_force_type, "Internal") == 0) {
-			/* fallback to NCCL internal tuner */
-			NCCL_OFI_INFO(NCCL_INIT | NCCL_TUNING,
-				      "NCCL_OFI_TUNER_TYPE is Internal, Fall back to NCCL's tuner for platform : %s",
-				      platform_type);
-			goto exit;
-		} else if (strcmp(tuner_force_type, "Model") == 0) {
-			is_force_type_model = 1;
-		}
+	if (ofi_nccl_tuner_force_type.get() == TUNER_TYPE::INTERNAL) {
+		/* fallback to NCCL internal tuner */
+		NCCL_OFI_INFO(NCCL_INIT | NCCL_TUNING,
+			      "NCCL_OFI_TUNER_TYPE is Internal, Fall back to NCCL's tuner for platform : %s",
+			      platform_type);
+		goto exit;
+	} else if (ofi_nccl_tuner_force_type.get() == TUNER_TYPE::MODEL) {
+		is_force_type_model = 1;
+	}
+
+	if (ofi_nccl_force_num_rails.get_source() != ParamSource::DEFAULT) {
+		// Because the tuner init is a local call, there is not a great
+		// way to determine if the job is running on homogeneous
+		// hardware. At some point, we should track this in the net
+		// plugin and if we detect heterogeneity, start returning the
+		// internal tuner defaults instead of our overrides. But for
+		// now, we can take advantage of the fact that each AWS platform
+		// has a different number of NICs per GPU and that a
+		// heterogeneous job will have OFI_NCCL_FORCE_NUM_RAILS set by
+		// the user as a key that this is a heterogeneous job. In that
+		// case, abort out of the OFI tuner and use the internal tuner
+		// (which does run after graph minimization, so will always
+		// return the same answer on every process).
+		NCCL_OFI_INFO(NCCL_INIT | NCCL_TUNING,
+			      "Falling back to NCCL's tuner due to OFI_NCCL_FORCE_NUM_RAILS being set.");
+		goto exit;
 	}
 
 	if (strcmp(platform_type, "p5.48xlarge") == 0 || strcmp(platform_type, "p5e.48xlarge") == 0) {
 		tuner_platform = NCCL_OFI_TUNER_P5_P5E;
 	} else if (strcmp(platform_type, "p5en.48xlarge") == 0) {
 		tuner_platform = NCCL_OFI_TUNER_P5EN;
+	} else if (strcmp(platform_type, "p6-b200.48xlarge") == 0) {
+		tuner_platform = NCCL_OFI_TUNER_P6;
 	} else {
 		tuner_platform = NCCL_OFI_TUNER_UNKNOWN;
 	}
@@ -118,7 +149,7 @@ static ncclResult_t nccl_ofi_tuner_init(size_t nRanks, size_t nNodes, ncclDebugL
 	 */
 
 	if (region_support && !(model_support && is_force_type_model)) {
-		ctx->type = NCCL_OFI_TUNER_TYPE_REGION;
+		ctx->type = TUNER_TYPE::REGION;
 		ctx->init_internal = region_init_internal;
 		ctx->get_coll_info_internal_v3 = region_get_coll_info_internal_v3;
 		ctx->get_coll_info_internal_v2 = region_get_coll_info_internal_v2;
@@ -126,7 +157,7 @@ static ncclResult_t nccl_ofi_tuner_init(size_t nRanks, size_t nNodes, ncclDebugL
 		NCCL_OFI_INFO(NCCL_INIT | NCCL_TUNING, "Region base Tuner is chosen for platform: %s", platform_type);
 	} else {
 		assert(model_support);
-		ctx->type = NCCL_OFI_TUNER_TYPE_MODEL;
+		ctx->type = TUNER_TYPE::MODEL;;
 		ctx->init_internal = model_init_internal;
 		ctx->get_coll_info_internal_v3 = model_get_coll_info_internal_v3;
 		ctx->get_coll_info_internal_v2 = model_get_coll_info_internal_v2;
@@ -149,6 +180,26 @@ exit:
 
 	return ret;
 }
+
+
+static ncclResult_t nccl_ofi_tuner_init_v2(size_t nRanks, size_t nNodes, ncclDebugLogger_t logFunction, void **context)
+{
+	/*
+	 * NCCL parses these variables and applies user filters inside its
+	 * current tuner logic. The tuner_v2 does not support setting these
+	 * variables and so the internal tuner will be used instead.
+	 */
+	if (getenv("NCCL_ALGO") || getenv("NCCL_PROTO")) {
+		NCCL_OFI_INFO(NCCL_INIT | NCCL_TUNING, "The tuner plugin can not be loaded when "
+				"explicitly choosing an algorithm or protocol "
+				"with NCCL_ALGO/NCCL_PROTO. "
+				"Defaulting to internal tuner.");
+		*context = nullptr;
+		return ncclSuccess;
+	}
+	return nccl_ofi_tuner_init(nRanks, nNodes, logFunction, context);
+}
+
 
 static ncclResult_t nccl_ofi_tuner_get_coll_info(void *context,
 						 ncclFunc_t collType,
@@ -203,7 +254,7 @@ static ncclResult_t nccl_ofi_tuner_get_coll_info_v2(
 }
 
 extern "C" const ncclTuner_v2_t ncclTunerPlugin_v2 = {.name = "nccl_ofi_tuner",
-					   .init = nccl_ofi_tuner_init,
+					   .init = nccl_ofi_tuner_init_v2,
 					   .getCollInfo = nccl_ofi_tuner_get_coll_info_v2,
 					   .destroy = nccl_ofi_tuner_destroy};
 
@@ -243,19 +294,16 @@ static ncclResult_t nccl_ofi_tuner_init_v1(size_t nRanks, size_t nNodes, ncclDeb
 
 	/*
 	 * NCCL parses these variables and applies user filters inside its
-	 * current tuner logic. Ideally, this should be done regardless of the
-	 * use of NCCL's internal tuner or an external tuner plugin. For the
-	 * time being, given the external tuner is an opt-in, detect if a user
-	 * has set one of them and bail when an external tuner is loaded.
+	 * current tuner logic. The tuner_v1 does not support setting these
+	 * variables and so the internal tuner will be used instead.
 	 */
 	if (getenv("NCCL_ALGO") || getenv("NCCL_PROTO")) {
-		NCCL_OFI_WARN("The tuner plugin can not be loaded when explicitly choosing an algorithm or protocol with NCCL_ALGO/NCCL_PROTO");
-		// FIXME: "ncclInvalidUsage should be returned when the error is
-		// most likely a user error" per nccl docs, which arguably makes
-		// it a better return code here than ncclInvalidArgument, but
-		// the former is currently not vended in ext-net headers, so
-		// we're returning ncclInvalidArgument instead.
-		return ncclInvalidArgument;
+		NCCL_OFI_INFO(NCCL_INIT | NCCL_TUNING, "The tuner plugin can not be loaded when "
+				"explicitly choosing an algorithm or protocol "
+				"with NCCL_ALGO/NCCL_PROTO. "
+				"Defaulting to internal tuner.");
+		nccl_ofi_tuner_destroy_v1();
+		return ncclSuccess;
 	}
 	return nccl_ofi_tuner_init(nRanks, nNodes, logFunction, (void **)&nccl_ofi_tuner_ctx_internal);
 }

@@ -123,46 +123,72 @@ static inline ncclResult_t msg_length_verify_max_size(const size_t *sizes, const
 		}
 	}
 	return ncclSuccess;
-	}
-
-
-static void nccl_net_ofi_fini(void)
-{
-	if (plugin != NULL) {
-		int ret = plugin->release_plugin(plugin);
-		if (ret != 0) {
-			NCCL_OFI_INFO(NCCL_NET, "Failure in plugin cleanup");
-		}
-		plugin = NULL;
-	}
 }
 
 
-ncclResult_t nccl_net_ofi_init_v2(ncclDebugLogger_t logFunction)
+ncclResult_t nccl_net_ofi_fini_v6()
 {
-	int ret;
+	ncclResult_t ret = ncclSuccess;
+	if (plugin == NULL) {
+		ret = check_return(ncclSystemError);
+	} else {
+		delete plugin;
+		plugin = NULL;
+	}
+	return ret;
+}
 
-	if (plugin != NULL) {
+
+static void nccl_net_ofi_fini_v2(void)
+{
+	nccl_net_ofi_fini_v6();
+}
+
+
+ncclResult_t nccl_net_ofi_init_v6(ncclDebugLogger_t logFunction)
+{
+	int ret = 0;
+
+	if (plugin != nullptr) {
 		return check_return(ncclSystemError);
 	}
 
 	ofi_log_function = logFunction;
 
 	abort_on_error = (ofi_nccl_abort_on_error() != 0);
-
-	ret = nccl_net_ofi_create_plugin(&plugin);
-	if (OFI_UNLIKELY(ret != 0)) {
-		NCCL_OFI_WARN("Initializing plugin failed");
-		return nccl_net_ofi_retval_translate(ret);
+	try {
+		ret = nccl_net_ofi_create_plugin(&plugin);
+		if (OFI_UNLIKELY(ret != 0)) {
+			NCCL_OFI_WARN("Initializing plugin failed");
+			return nccl_net_ofi_retval_translate(ret);
+		}
+	}
+	catch (const std::exception &e) {
+		NCCL_OFI_WARN("Caught exception in plugin init: %s", e.what());
+		ret = -EINVAL;
 	}
 
-	ret = atexit(nccl_net_ofi_fini);
-	if (ret != 0) {
+	return nccl_net_ofi_retval_translate(ret);
+}
+
+
+ncclResult_t nccl_net_ofi_init_v2(ncclDebugLogger_t logFunction)
+{
+	int rc;
+	ncclResult_t ret;
+
+	ret = nccl_net_ofi_init_v6(logFunction);
+	if (OFI_UNLIKELY(ret != ncclSuccess)) {
+		return ret;
+	}
+
+	rc = atexit(nccl_net_ofi_fini_v2);
+	if (rc != 0) {
 		NCCL_OFI_WARN("Adding cleanup function failed");
-		return nccl_net_ofi_retval_translate(ret);
+		return nccl_net_ofi_retval_translate(rc);
 	}
 
-	return ncclSuccess;
+	return ret;
 }
 
 
@@ -179,7 +205,7 @@ ncclResult_t nccl_net_ofi_devices_v2(int *num_devices)
 		return check_return(ncclInvalidArgument);
 	}
 
-	*num_devices = plugin->get_num_devices(plugin);
+	*num_devices = plugin->get_num_devices();
 	return ncclSuccess;
 }
 
@@ -194,13 +220,13 @@ ncclResult_t nccl_net_ofi_get_properties(int dev_id, nccl_ofi_properties_t *ofi_
 		return check_return(ncclInvalidArgument);
 	}
 
-	device = plugin->get_device(plugin, dev_id);
+	device = plugin->get_device(dev_id);
 	if (device == NULL) {
 		NCCL_OFI_WARN("Error accessing device %i.", dev_id);
 		return check_return(ncclInternalError);
 	}
 
-	int ret = device->get_properties(device, ofi_properties);
+	int ret = device->get_properties(ofi_properties);
 	return nccl_net_ofi_retval_translate(ret);
 }
 
@@ -210,7 +236,7 @@ ncclResult_t nccl_net_ofi_listen_v2(int dev, void* handle, void** listenComm)
         nccl_net_ofi_conn_handle_t nccl_net_ofi_handle = {};
 	ncclResult_t ret;
 
-	if (0 == strcasecmp(nccl_ofi_selected_protocol, "RDMA")) {
+	if (ofi_nccl_protocol.get() == PROTOCOL::RDMA) {
 		NCCL_OFI_WARN("RDMA protocol does not support blocking listen interface");
 		return check_return(ncclInternalError);
 	}
@@ -227,41 +253,44 @@ ncclResult_t nccl_net_ofi_listen_v2(int dev, void* handle, void** listenComm)
 ncclResult_t nccl_net_ofi_listen_v5(int dev_id, void *handle, void **lComm)
 {
 	int ret = 0;
-	nccl_net_ofi_device_t *device = NULL;
-	nccl_net_ofi_ep_t *base_ep = NULL;
+	nccl_net_ofi_device_t *device = nullptr;
+	nccl_net_ofi_ep_t *ep = nullptr;
 	nccl_net_ofi_listen_comm_t **listen_comm =
-		(nccl_net_ofi_listen_comm_t **)lComm;
+		reinterpret_cast<nccl_net_ofi_listen_comm_t **>(lComm);
 
 	/* Validate plugin */
-	if (OFI_UNLIKELY(plugin == NULL)) {
+	if (OFI_UNLIKELY(plugin == nullptr)) {
 		NCCL_OFI_WARN("Error accessing plugin. Plugin has not been initialized yet.");
 		return check_return(ncclInvalidArgument);
 	}
+	try {
+		device = plugin->get_device(dev_id);
+		if (device == nullptr) {
+			NCCL_OFI_WARN("Error accessing device %i.", dev_id);
+			return check_return(ncclInternalError);
+		}
+		/* Validate Handle */
+		if (OFI_UNLIKELY(handle == nullptr)) {
+			NCCL_OFI_WARN("Provided handle is nullptr");
+			return check_return(ncclInvalidArgument);
+		}
 
-	device = plugin->get_device(plugin, dev_id);
-	if (device == NULL) {
-		NCCL_OFI_WARN("Error accessing device %i.", dev_id);
-		return check_return(ncclInternalError);
+		/* Retrieve and validate endpoint */
+		ep = device->get_ep();
+		if (OFI_UNLIKELY(ep == nullptr)) {
+			NCCL_OFI_WARN("Error accessing endpoint. Endpoint has not been initialized.");
+			return check_return(ncclInternalError);
+		}
+
+		ret = ep->listen(static_cast<nccl_net_ofi_conn_handle_t *>(handle), listen_comm);
 	}
-	/* Validate Handle */
-	if (OFI_UNLIKELY(handle == NULL)) {
-		NCCL_OFI_WARN("Provided handle is NULL");
-		return check_return(ncclInvalidArgument);
+	catch (const std::exception &e) {
+		NCCL_OFI_WARN("Caught exception in plugin listen: %s", e.what());
+		ret = -EINVAL;
 	}
 
-	/* Retrieve and validate endpoint */
-	device->get_ep(device, &base_ep);
-	if (OFI_UNLIKELY(base_ep == NULL)) {
-		NCCL_OFI_WARN("Error accessing endpoint. Endpoint has not been initialized.");
-		return check_return(ncclInternalError);
-	}
-
-	ret = base_ep->listen(base_ep,
-						  (nccl_net_ofi_conn_handle_t *)handle,
-						  listen_comm);
-
-	if (ret != 0) {
-		base_ep->release_ep(base_ep, false, false);
+	if (ret != 0 && ep != nullptr) {
+		ep->release_ep(false, false);
 	}
 	return nccl_net_ofi_retval_translate(ret);
 }
@@ -272,7 +301,7 @@ ncclResult_t nccl_net_ofi_connect_v2(int dev, void* handle, void** sendComm)
 	ncclResult_t ret = ncclSuccess;
         nccl_net_ofi_conn_handle_t nccl_net_ofi_handle = {};
 
-	if (0 == strcasecmp(nccl_ofi_selected_protocol, "RDMA")) {
+	if (ofi_nccl_protocol.get() == PROTOCOL::RDMA) {
 		NCCL_OFI_WARN("RDMA protocol does not support blocking connect interface");
 		return check_return(ncclInternalError);
 	}
@@ -296,9 +325,9 @@ ncclResult_t nccl_net_ofi_connect_v5(int dev_id, void *handle, void **sComm)
 
 
 /*
- * @brief	Non-blocking connect which returns sComm as NULL
+ * @brief	Non-blocking connect which returns sComm as nullptr
  *		with an expectation that it will be called again until 
- *		sComm != NULL
+ *		sComm != nullptr
  *
  * The callee obtains one endpoint handle via the device's get_ep()
  * function for each specific handle.  Further invocations of this
@@ -314,15 +343,15 @@ ncclResult_t nccl_net_ofi_connect_v5(int dev_id, void *handle, void **sComm)
  * @param	Network Device ID
  * 		Connection Handle (transferred OOB by NCCL)
  *
- * @return	sComm = NULL, if connection hasn't been established
- * 		sComm != NULL, once connection is established
+ * @return	sComm = nullptr, if connection hasn't been established
+ * 		sComm != nullptr, once connection is established
  * @return	0, on success
  * 		error, on others
  */
 ncclResult_t nccl_net_ofi_connect_v10(int dev_id, void *handle, void **sComm, int trafficClass)
 {
 	/* Validate plugin */
-	if (OFI_UNLIKELY(plugin == NULL)) {
+	if (OFI_UNLIKELY(plugin == nullptr)) {
 		NCCL_OFI_WARN("Error accessing plugin. Plugin has not been initialized yet.");
 		return check_return(ncclInvalidArgument);
 	}
@@ -330,39 +359,55 @@ ncclResult_t nccl_net_ofi_connect_v10(int dev_id, void *handle, void **sComm, in
 	/* Retrieve and validate Handle */
 	nccl_net_ofi_conn_handle_t *ofi_handle =
 		(nccl_net_ofi_conn_handle_t *)handle;
-	if (OFI_UNLIKELY(ofi_handle == NULL)) {
+	if (OFI_UNLIKELY(ofi_handle == nullptr)) {
 		NCCL_OFI_WARN("Provided handle is NULL");
 		return check_return(ncclInvalidArgument);
 	}
 
 	/* Retrieve and validate endpoint */
-	nccl_net_ofi_ep_t *base_ep = NULL;
-	if (ofi_handle->state.stage == COMM_CREATE_START) {
-		nccl_net_ofi_device_t *device = plugin->get_device(plugin, dev_id);
-		if (device == NULL) {
-			NCCL_OFI_WARN("Error accessing device %i.", dev_id);
-			return check_return(ncclInternalError);
+	nccl_net_ofi_ep_t *ep = nullptr;
+	bool created_ep = false;
+	int ret = 0;
+	try {
+		if (ofi_handle->state.comm == nullptr) {
+			nccl_net_ofi_device_t *device = plugin->get_device(dev_id);
+			if (device == nullptr) {
+				NCCL_OFI_WARN("Error accessing device %i.", dev_id);
+				return check_return(ncclInternalError);
+			}
+
+			ep = device->get_ep();
+			if (OFI_UNLIKELY(ep == nullptr)) {
+				return check_return(ncclInternalError);
+			}
+			created_ep = true;
+		} else {
+			ep = ofi_handle->state.comm->ep;
+			if (OFI_UNLIKELY(ep == nullptr)) {
+				NCCL_OFI_WARN("Error accessing endpoint. Endpoint has not been initialized.");
+				return check_return(ncclInternalError);
+			}
 		}
 
-		int ret = device->get_ep(device, &base_ep);
-		if (OFI_UNLIKELY(ret != 0)) {
-			return nccl_net_ofi_retval_translate(ret);
-		}
-	} else {
-		base_ep = ofi_handle->state.comm->ep;
-		if (OFI_UNLIKELY(base_ep == NULL)) {
-			NCCL_OFI_WARN("Error accessing endpoint. Endpoint has not been initialized.");
-			return check_return(ncclInternalError);
-		}
+		/* Connect */
+		nccl_net_ofi_send_comm_t **send_comm =
+			reinterpret_cast<nccl_net_ofi_send_comm_t **>(sComm);
+		ret = ep->connect(static_cast<nccl_net_ofi_conn_handle_t *>(handle),
+				  send_comm,
+				  trafficClass);
+	}
+	catch (const std::exception &e) {
+		NCCL_OFI_WARN("Caught exception in plugin connect: %s", e.what());
+		ret = -EINVAL;
 	}
 
-	/* Connect */
-	nccl_net_ofi_send_comm_t **send_comm =
-		(nccl_net_ofi_send_comm_t **)sComm;
-	int ret = base_ep->connect(base_ep, (nccl_net_ofi_conn_handle_t *)handle, send_comm, trafficClass);
-
-	if (ret != 0) {
-		base_ep->release_ep(base_ep, false, false);
+	if (created_ep) {
+		/**
+		 * Release the ep if we acquired one before calling
+		 * ep->connect(). The protocol should have acquired its own
+		 * endpoint when creating the communictor.
+		 */
+		ep->release_ep(false, false);
 	}
 
 	return nccl_net_ofi_retval_translate(ret);
@@ -373,7 +418,7 @@ ncclResult_t nccl_net_ofi_accept_v2(void* listenComm, void** recvComm)
 {
 	ncclResult_t ret = ncclInvalidArgument;
 
-	if (0 == strcasecmp(nccl_ofi_selected_protocol, "RDMA")) {
+	if (ofi_nccl_protocol.get() == PROTOCOL::RDMA) {
 		NCCL_OFI_WARN("RDMA protocol does not support blocking accept interface.");
 		return check_return(ncclInternalError);
 	}
@@ -391,51 +436,57 @@ error:
 
 
 /*
- * @brief	Non-blocking accept which returns rComm as NULL
+ * @brief	Non-blocking accept which returns rComm as nullptr
  * 		with an expectation that it will be called again until
- * 		rComm != NULL
+ * 		rComm != nullptr
  *
  * If accept fails by returning a result other than ncclSuccess,
  * release_ep() is invoked on the listen communicator's endpoint.
  *
  * @param	Listen Communicator object
  *
- * @return	rComm = NULL, if connection hasn't been established
- * 		rComm != NULL, once connection is established
+ * @return	rComm = nullptr, if connection hasn't been established
+ * 		rComm != nullptr, once connection is established
  * @return	0, on success
  * 		error, on others
  */
 ncclResult_t nccl_net_ofi_accept_v5(void *lComm, void **rComm)
 {
-	if (OFI_UNLIKELY(plugin == NULL)) {
+	if (OFI_UNLIKELY(plugin == nullptr)) {
 		NCCL_OFI_WARN("Error accessing plugin. Plugin has not been initialized yet.");
 		return check_return(ncclInvalidArgument);
 	}
 
 	/* Verify communicator */
-	if (lComm == NULL) {
+	if (lComm == nullptr) {
 		NCCL_OFI_WARN("Invalid listen communicator provided");
 		return check_return(ncclInternalError);
 	}
 
 	/* Invoke listen communicator accept() function */
 	nccl_net_ofi_listen_comm_t *listen_comm =
-		(nccl_net_ofi_listen_comm_t *)lComm;
+		reinterpret_cast<nccl_net_ofi_listen_comm_t *>(lComm);
 	nccl_net_ofi_recv_comm_t **recv_comm =
-		(nccl_net_ofi_recv_comm_t **)rComm;
-	int ret = listen_comm->accept(listen_comm, recv_comm);
+		reinterpret_cast<nccl_net_ofi_recv_comm_t **>(rComm);
+	int ret = 0;
+	try {
+		ret = listen_comm->accept(listen_comm, recv_comm);
+	}
+	catch (const std::exception &e) {
+		NCCL_OFI_WARN("Caught exception in plugin accept: %s", e.what());
+		ret = -EINVAL;
+	}
 
 	/* Invoke release_ep() on listen comm's endpoint since accept failed */
 	if (ret != 0) {
 		/* Retrieve and validate endpoint */
-		nccl_net_ofi_ep_t *ep =
-			listen_comm->base.ep;
-		if (OFI_UNLIKELY(ep == NULL)) {
+		nccl_net_ofi_ep_t *ep = listen_comm->base.ep;
+		if (OFI_UNLIKELY(ep == nullptr)) {
 			NCCL_OFI_WARN("Invalid endpoint provided");
 			ret = -EINVAL;
 			goto error;
 		}
-		ep->release_ep(ep, false, false);
+		ep->release_ep(false, false);
 	}
 
 error:
@@ -484,7 +535,7 @@ ncclResult_t nccl_net_ofi_regMrDmaBuf_v6(void* comm, void* data, size_t size,
 	/* Validate type of buffer */
 	bool valid_buffer_type = false;
 	if (type == NCCL_PTR_HOST) valid_buffer_type = true;
-#if HAVE_CUDA
+#if HAVE_GPU
 	if (type == NCCL_PTR_CUDA) valid_buffer_type = true;
 #endif
 #if HAVE_NEURON
@@ -870,6 +921,7 @@ ncclResult_t nccl_net_ofi_get_mr_key_v5(void* mhandle, uint64_t* mr_key)
 {
 	int ret = 0;
 	nccl_net_ofi_device_t *device = NULL;
+	auto *mhandle_ptr = static_cast<nccl_net_ofi_mr_handle_t *>(mhandle);
 
 	/* Validate plugin */
 	if (OFI_UNLIKELY(plugin == NULL)) {
@@ -877,22 +929,17 @@ ncclResult_t nccl_net_ofi_get_mr_key_v5(void* mhandle, uint64_t* mr_key)
 		return check_return(ncclInvalidArgument);
 	}
 
-	if (OFI_UNLIKELY(plugin->p_num_devs == 0)) {
+	if (OFI_UNLIKELY(plugin->get_num_devices() == 0)) {
 		return check_return(ncclInvalidArgument);
 	}
 
-	device = plugin->get_device(plugin, 0);
+	device = plugin->get_device(0);
 	if (OFI_UNLIKELY(device == NULL)) {
 		NCCL_OFI_WARN("Error accessing device %i.", 0);
 		return check_return(ncclInternalError);
 	}
 
-	if (OFI_UNLIKELY(device->get_mr_key == NULL)) {
-		NCCL_OFI_WARN("Protocol does not support getMrKey API function");
-		return check_return(ncclInternalError);
-	}
-
-	ret = device->get_mr_key(device, mhandle, mr_key);
+	ret = mhandle_ptr->get_mr_key(mr_key);
 	return nccl_net_ofi_retval_translate(ret);
 }
 

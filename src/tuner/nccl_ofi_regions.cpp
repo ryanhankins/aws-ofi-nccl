@@ -4,8 +4,11 @@
 
 #include "config.h"
 
+#include <cassert>
+#include <cstring>
 #include <math.h>
 
+#include "internal/tuner/nccl_defaults.h"
 #include "tuner/nccl_ofi_tuner_region.h"
 #include "nccl_ofi_param.h"
 
@@ -21,6 +24,7 @@ typedef struct nccl_ofi_tuner_region_context {
 	struct nccl_ofi_tuner_region_dims dims;
 	size_t num_regions[NCCL_NUM_FUNCTIONS];
 	nccl_ofi_tuner_region_t *regions[NCCL_NUM_FUNCTIONS];
+	int log2_nnodes; /* log2 of number of nodes */
 } nccl_ofi_tuner_region_context_t;
 
 /* Vector subtraction */
@@ -123,7 +127,7 @@ static inline double distance(nccl_ofi_tuner_point_t x,
 			      double eps)
 {
 	nccl_ofi_tuner_point_t dy = vsub(y1, y0);
-	nccl_ofi_tuner_point_t x1, s;
+	nccl_ofi_tuner_point_t x1, s = {0, 0};
 	int r;
 
 	x1.x = x.x + dy.y;
@@ -151,12 +155,12 @@ static inline double distance(nccl_ofi_tuner_point_t x,
  * 		-1 for outside
  * 		0 for on edge.
  */
-int is_inside_region(nccl_ofi_tuner_point_t point, nccl_ofi_tuner_region_t *region)
+int is_inside_region(nccl_ofi_tuner_point_t point, const nccl_ofi_tuner_region_t *region)
 {
 	assert(region->num_vertices > 1);
 
 	size_t i, k;
-	nccl_ofi_tuner_point_t *pv;
+	const nccl_ofi_tuner_point_t *pv;
 	double min_x, max_x, min_y, max_y;
 	const double eps = 1e-10;
 
@@ -229,6 +233,14 @@ static ncclResult_t set_regions(nccl_ofi_tuner_region_context_t *region_ctx,
 	}
 
 	memcpy(region_ctx->regions[collType], &regions[0], num_regions * sizeof(nccl_ofi_tuner_region_t));
+
+	for (size_t i = 0; i < num_regions; i++) {
+		nccl_ofi_tuner_region& region = region_ctx->regions[collType][i];
+		for (size_t j = 0; j < region.num_vertices; j++) {
+			region.vertices[j].transform_log2_x();
+		}
+	}
+
 	return ncclSuccess;
 }
 
@@ -241,15 +253,22 @@ nccl_ofi_tuner_point_t extend_region(nccl_ofi_tuner_point_t a, nccl_ofi_tuner_po
 {
 	nccl_ofi_tuner_point_t ret;
 
+	a.transform_log2_x();
+	b.transform_log2_x();
+	z.transform_log2_x();
+	ret.coord_scale = nccl_ofi_tuner_point_t::X_LOG2;
+
 	if (a.x == b.x) {
 		/* a and b are on the same vertical line */
-		ret = (nccl_ofi_tuner_point_t){.x = a.x, .y = z.y};
+		ret.x = a.x, ret.y = z.y;
+		ret.transform_pow2_x();
 		return ret;
 	}
 
 	if (a.y == b.y) {
 		/* a and b are on the same horizontal line */
-		ret = (nccl_ofi_tuner_point_t){.x = z.x, .y = a.y};
+		ret.x = z.x, ret.y = a.y;
+		ret.transform_pow2_x();
 		return ret;
 	}
 
@@ -258,11 +277,12 @@ nccl_ofi_tuner_point_t extend_region(nccl_ofi_tuner_point_t a, nccl_ofi_tuner_po
 	double projected_zy = m * z.x + c;
 
 	if (projected_zy < z.y) {
-		ret = (nccl_ofi_tuner_point_t){.x = z.x, .y = projected_zy};
+		ret.x = z.x, ret.y = projected_zy;
 	} else {
-		ret = (nccl_ofi_tuner_point_t){.x = (z.y - c) / m, .y = z.y};
+		ret.x = (z.y - c) / m, ret.y = z.y;
 	}
 
+	ret.transform_pow2_x();
 	return ret;
 }
 
@@ -281,62 +301,69 @@ static ncclResult_t region_init_internal_p5en(nccl_ofi_tuner_region_context_t *r
 		{
 			collType = ncclFuncAllReduce;
 			nccl_ofi_tuner_point_t extended_tree_ll =
-				extend_region((nccl_ofi_tuner_point_t){262144, 192},
-							  (nccl_ofi_tuner_point_t){262144, 1024},
+				extend_region((nccl_ofi_tuner_point_t){196608, 192},
+							  (nccl_ofi_tuner_point_t){196608, 1024},
 							  (nccl_ofi_tuner_point_t){TUNER_MAX_SIZE, TUNER_MAX_RANKS});
 			nccl_ofi_tuner_point_t extended_tree_ll128 =
-				extend_region((nccl_ofi_tuner_point_t){150994944, 128},
-							  (nccl_ofi_tuner_point_t){251658240, 1024},
+				extend_region((nccl_ofi_tuner_point_t){129499136, 127},
+							  (nccl_ofi_tuner_point_t){218103808, 1024},
 							  (nccl_ofi_tuner_point_t){TUNER_MAX_SIZE, TUNER_MAX_RANKS});
 			nccl_ofi_tuner_point_t extended_nvlstree_simple =
-				extend_region((nccl_ofi_tuner_point_t){6442450944, 256},
-							  (nccl_ofi_tuner_point_t){17179869184, 768},
+				extend_region((nccl_ofi_tuner_point_t){7516192768, 256},
+							  (nccl_ofi_tuner_point_t){17179869184, 448},
 							  (nccl_ofi_tuner_point_t){TUNER_MAX_SIZE, TUNER_MAX_RANKS});
 
 			const nccl_ofi_tuner_region_t regions[] = {
 				{.algorithm = NCCL_ALGO_TREE,
 				 .protocol = NCCL_PROTO_LL,
-				 .num_vertices = 4,
-				 .vertices = {{0, 16}, {262144, 16}, {262144, 1024}, extended_tree_ll}},
+				 .num_vertices = 5,
+				 .vertices = {{0, 16}, {196608, 16}, {196608, 1024}, extended_tree_ll, {0, TUNER_MAX_RANKS}}},
 				{.algorithm = NCCL_ALGO_TREE,
 				 .protocol = NCCL_PROTO_LL128,
 				 .num_vertices = 7,
-				 .vertices = {extended_tree_ll,
-							  {262144, 1024},
-							  {262144, 16},
-							  {14680064, 16},
-							  {150994944, 128},
-							  {251658240, 1024},
-							  extended_tree_ll128}},
+				 .vertices = {
+					extended_tree_ll,
+					{196608, 1024},
+					{196608, 16},
+					{13107200, 16},
+					{129499136, 127},
+					{218103808, 1024},
+					extended_tree_ll128}},
 				{.algorithm = NCCL_ALGO_RING,
 				 .protocol = NCCL_PROTO_LL128,
-				 .num_vertices = 5,
-				 .vertices = {{150994944, 128},
-							  {14680064, 16},
-							  {33554432, 16},
-							  {536870912, 32},
-							  {536870912, 128}}},
+				 .num_vertices = 6,
+				 .vertices = {
+					{129499136, 127},
+					{13107200, 16},
+					{29884416, 16},
+					{293601280, 32},
+					{589299712, 64},
+					{549453824, 128}}},
 				{.algorithm = NCCL_ALGO_NVLS_TREE,
 				 .protocol = NCCL_PROTO_SIMPLE,
-				 .num_vertices = 8,
-				 .vertices = {extended_tree_ll128,
-							  {251658240, 1024},
-							  {150994944, 128},
-							  {536870912, 128},
-							  {536870912, 32},
-							  {6442450944, 256},
-							  {17179869184, 768},
-							  extended_nvlstree_simple}},
+				 .num_vertices = 12,
+				 .vertices = {
+					extended_tree_ll128,
+					{218103808, 1024},
+					{129499136, 127},
+					{549453824, 128},
+					{589299712, 64},
+					{293601280, 32},
+					{29884416, 16},
+					{TUNER_MAX_SIZE, 16},
+					{509607936, 32},
+					{7516192768, 256},
+					{17179869184, 448},
+					extended_nvlstree_simple}},
 				{.algorithm = NCCL_ALGO_RING,
 				 .protocol = NCCL_PROTO_SIMPLE,
-				 .num_vertices = 7,
-				 .vertices = {extended_nvlstree_simple,
-							  {17179869184, 768},
-							  {6442450944, 256},
-							  {536870912, 32},
-							  {33554432, 16},
-							  {1073741824, 16},
-							  {TUNER_MAX_SIZE, 16}}}};
+				 .num_vertices = 5,
+				 .vertices = {
+					extended_nvlstree_simple,
+					{17179869184, 448},
+					{7516192768, 256},
+					{509607936, 32},
+					{TUNER_MAX_SIZE, 16}}}};
 			ret = set_regions(region_ctx, collType, sizeof(regions) / sizeof(regions[0]), regions);
 			if (ret != ncclSuccess) {
 				goto exit;
@@ -345,41 +372,55 @@ static ncclResult_t region_init_internal_p5en(nccl_ofi_tuner_region_context_t *r
 		{
 			collType = ncclFuncAllGather;
 			nccl_ofi_tuner_point_t extended_ring_ll =
-				extend_region((nccl_ofi_tuner_point_t){8388608, 256},
+				extend_region((nccl_ofi_tuner_point_t){28305408, 768},
 							  (nccl_ofi_tuner_point_t){33554432, 1024},
 							  (nccl_ofi_tuner_point_t){TUNER_MAX_SIZE, TUNER_MAX_RANKS});
 			nccl_ofi_tuner_point_t extended_ring_ll128 =
-				extend_region((nccl_ofi_tuner_point_t){8589934592, 512},
-							  (nccl_ofi_tuner_point_t){17179869184, 1024},
+				extend_region((nccl_ofi_tuner_point_t){7247754240, 384},
+							  (nccl_ofi_tuner_point_t){17179865088, 896},
 							  (nccl_ofi_tuner_point_t){TUNER_MAX_SIZE, TUNER_MAX_RANKS});
 
 			const nccl_ofi_tuner_region_t regions[] = {
 				{.algorithm = NCCL_ALGO_RING,
 				 .protocol = NCCL_PROTO_LL,
-				 .num_vertices = 7,
-				 .vertices = {{0, 16}, {131072, 16}, {262144, 32}, {8388608, 256}, {33554432, 1024}, extended_ring_ll, {0, TUNER_MAX_RANKS}}},
+				 .num_vertices = 9,
+				 .vertices = {
+					{0, 16},
+					{786432, 16},
+					{4718592, 128},
+					{13630464, 384},
+					{19922944, 512},
+					{28305408, 768},
+					{33554432, 1024},
+					extended_ring_ll,
+					{0, TUNER_MAX_RANKS}}},
 				{.algorithm = NCCL_ALGO_RING,
 				 .protocol = NCCL_PROTO_LL128,
-				 .num_vertices = 10,
-				 .vertices = {extended_ring_ll,
-							  {33554432, 1024},
-							  {8388608, 256},
-							  {262144, 32},
-							  {131072, 16},
-							  {268435456, 16},
-							  {2147483648, 128},
-							  {8589934592, 512},
-							  {17179869184, 1024},
-							  extended_ring_ll128}},
+				 .num_vertices = 12,
+				 .vertices = {
+					extended_ring_ll,
+					{33554432, 1024},
+					{28305408, 768},
+					{19922944, 512},
+					{13630464, 384},
+					{4718592, 128},
+					{786432, 16},
+					{236978176, 16},
+					{956301312, 64},
+					{7247754240, 384},
+					{17179865088, 896},
+					extended_ring_ll128}},
 				{.algorithm = NCCL_ALGO_RING,
 				 .protocol = NCCL_PROTO_SIMPLE,
-				 .num_vertices = 6,
-				 .vertices = {extended_ring_ll128,
-							  {17179869184, 1024},
-							  {8589934592, 512},
-							  {268435456, 16},
-							  {17179869184, 16},
-							  {TUNER_MAX_SIZE, 16}}}};
+				 .num_vertices = 7,
+				 .vertices = {
+					extended_ring_ll128,
+					{17179865088, 896},
+					{7247754240, 384},
+					{956301312, 64},
+					{494927872, 32},
+					{236978176, 16},
+					{TUNER_MAX_SIZE, 16}}}};
 			ret = set_regions(region_ctx, collType, sizeof(regions) / sizeof(regions[0]), regions);
 			if (ret != ncclSuccess) {
 				goto exit;
@@ -388,41 +429,52 @@ static ncclResult_t region_init_internal_p5en(nccl_ofi_tuner_region_context_t *r
 		{
 			collType = ncclFuncReduceScatter;
 			nccl_ofi_tuner_point_t extended_ring_ll =
-				extend_region((nccl_ofi_tuner_point_t){8388608, 256},
-							  (nccl_ofi_tuner_point_t){33554432, 1024},
+				extend_region((nccl_ofi_tuner_point_t){7340032, 256},
+							  (nccl_ofi_tuner_point_t){18874368, 512},
 							  (nccl_ofi_tuner_point_t){TUNER_MAX_SIZE, TUNER_MAX_RANKS});
 			nccl_ofi_tuner_point_t extended_ring_ll128 =
-				extend_region((nccl_ofi_tuner_point_t){8589934592, 512},
-							  (nccl_ofi_tuner_point_t){17179869184, 1024},
+				extend_region((nccl_ofi_tuner_point_t){7247757312, 256},
+							  (nccl_ofi_tuner_point_t){17179869184, 640},
 							  (nccl_ofi_tuner_point_t){TUNER_MAX_SIZE, TUNER_MAX_RANKS});
 
 			const nccl_ofi_tuner_region_t regions[] = {
 				{.algorithm = NCCL_ALGO_RING,
 				 .protocol = NCCL_PROTO_LL,
 				 .num_vertices = 7,
-				 .vertices = {{0, 16}, {131072, 16}, {262144, 32}, {8388608, 256}, {33554432, 1024}, extended_ring_ll, {0, TUNER_MAX_RANKS}}},
+				 .vertices = {
+					{0, 16},
+					{786432, 16},
+					{4718592, 128},
+					{7340032, 256},
+					{18874368, 512},
+					extended_ring_ll,
+					{0, TUNER_MAX_RANKS}}},
 				{.algorithm = NCCL_ALGO_RING,
 				 .protocol = NCCL_PROTO_LL128,
-				 .num_vertices = 10,
-				 .vertices = {extended_ring_ll,
-							  {33554432, 1024},
-							  {8388608, 256},
-							  {262144, 32},
-							  {131072, 16},
-							  {268435456, 16},
-							  {2147483648, 128},
-							  {8589934592, 512},
-							  {17179869184, 1024},
-							  extended_ring_ll128}},
+				 .num_vertices = 11,
+				 .vertices = {
+					extended_ring_ll,
+					{18874368, 512},
+					{7340032, 256},
+					{4718592, 128},
+					{786432, 16},
+					{291504128, 16},
+					{589299712, 32},
+					{2415919104, 128},
+					{7247757312, 256},
+					{17179869184, 640},
+					extended_ring_ll128}},
 				{.algorithm = NCCL_ALGO_RING,
 				 .protocol = NCCL_PROTO_SIMPLE,
-				 .num_vertices = 6,
-				 .vertices = {extended_ring_ll128,
-							  {17179869184, 1024},
-							  {8589934592, 512},
-							  {268435456, 16},
-							  {17179869184, 16},
-							  {TUNER_MAX_SIZE, 16}}}};
+				 .num_vertices = 7,
+				 .vertices = {
+					extended_ring_ll128,
+					{17179869184, 640},
+					{7247757312, 256},
+					{2415919104, 128},
+					{589299712, 32},
+					{291504128, 16},
+					 {TUNER_MAX_SIZE, 16}}}};
 			ret = set_regions(region_ctx, collType, sizeof(regions) / sizeof(regions[0]), regions);
 			if (ret != ncclSuccess) {
 				goto exit;
@@ -463,7 +515,7 @@ static ncclResult_t region_init_internal_p5en(nccl_ofi_tuner_region_context_t *r
 				 .protocol = NCCL_PROTO_SIMPLE,
 				 .num_vertices = 7,
 				 .vertices = {extended_tree_ll128,
-							  {1048576, 768},
+							  {1048576, 96},
 							  {524288, 8},
 							  {262144, 2},
 							  {8388608, 32},
@@ -899,6 +951,458 @@ exit:
 }
 
 
+/**
+ * P6 platform specific Regions
+ */
+static ncclResult_t region_init_internal_p6(nccl_ofi_tuner_region_context_t *region_ctx)
+{
+	ncclResult_t ret = ncclSuccess;
+	ncclFunc_t collType;
+	size_t nRanks = region_ctx->dims.num_ranks;
+	size_t nNodes = region_ctx->dims.num_nodes;
+
+	if (nRanks == 8 * nNodes) {
+		{
+			collType = ncclFuncAllReduce;
+
+			nccl_ofi_tuner_point_t extended_tree_ll =
+				extend_region((nccl_ofi_tuner_point_t){393216, 16},
+						(nccl_ofi_tuner_point_t){393216, 1024},
+						(nccl_ofi_tuner_point_t){TUNER_MAX_SIZE, TUNER_MAX_RANKS});
+			nccl_ofi_tuner_point_t extended_tree_ll128 =
+				extend_region((nccl_ofi_tuner_point_t){96993280, 1024},
+						(nccl_ofi_tuner_point_t){106430464, 2048},
+						(nccl_ofi_tuner_point_t){TUNER_MAX_SIZE, TUNER_MAX_RANKS});
+			nccl_ofi_tuner_point_t extended_nvlstree_simple =
+				extend_region((nccl_ofi_tuner_point_t){10737418240, 512},
+						(nccl_ofi_tuner_point_t){34359738368, 1500},
+						(nccl_ofi_tuner_point_t){TUNER_MAX_SIZE, TUNER_MAX_RANKS});
+
+			const nccl_ofi_tuner_region_t regions[] = {
+			{.algorithm = NCCL_ALGO_TREE,
+				.protocol = NCCL_PROTO_LL,
+				.num_vertices = 4,
+				.vertices = {{0, 16}, {393216, 16}, extended_tree_ll, {0, TUNER_MAX_RANKS}}},
+			{.algorithm = NCCL_ALGO_TREE,
+				.protocol = NCCL_PROTO_LL128,
+				.num_vertices = 10,
+				.vertices = {
+					extended_tree_ll,
+					{393216, 16},
+					{4718592, 16},
+					{18350080, 32},
+					{40370176, 64},
+					{57147392, 128},
+					{72876032, 256},
+					{96993280, 1024},
+					{106430464, 2048},
+					extended_tree_ll128}},
+			{.algorithm = NCCL_ALGO_RING,
+				.protocol = NCCL_PROTO_LL128,
+				.num_vertices = 5,
+				.vertices = {
+					{90701824, 128},
+					{50855936, 64},
+					{18350080, 32},
+					{133693440, 32},
+					{120061952, 64}}},
+			{.algorithm = NCCL_ALGO_NVLS_TREE,
+				.protocol = NCCL_PROTO_SIMPLE,
+				.num_vertices = 19,
+				.vertices = {
+					extended_tree_ll128,
+					{106430464, 2048},
+					{96993280, 1024},
+					{72876032, 256},
+					{57147392, 128},
+					{40370176, 64},
+					{18350080, 32},
+					{50855936, 64},
+					{90701824, 128},
+					{120061952, 64},
+					{133693440, 32},
+					{18350080, 32},
+					{4718592, 16},
+					{TUNER_MAX_SIZE, 16},
+					{435159040, 32},
+					{1072693248, 64},
+					{10737418240, 512},
+					{34359738368, 1500},
+					extended_nvlstree_simple}},
+			{.algorithm = NCCL_ALGO_RING,
+				.protocol = NCCL_PROTO_SIMPLE,
+				.num_vertices = 5,
+				.vertices = {
+					extended_nvlstree_simple,
+					{10737418240, 512},
+					{1072693248, 64},
+					{435159040, 32},
+					{TUNER_MAX_SIZE, 16}}}};
+			ret = set_regions(region_ctx, collType, sizeof(regions) / sizeof(regions[0]), regions);
+			if (ret != ncclSuccess) {
+				goto exit;
+			}
+		}
+		{
+			collType = ncclFuncAllGather;
+
+			nccl_ofi_tuner_point_t extended_ring_ll =
+				extend_region((nccl_ofi_tuner_point_t){74973184, 1024},
+						(nccl_ofi_tuner_point_t){213385216, 2048},
+						(nccl_ofi_tuner_point_t){TUNER_MAX_SIZE, TUNER_MAX_RANKS});
+			nccl_ofi_tuner_point_t extended_ring_ll128 =
+				extend_region((nccl_ofi_tuner_point_t){8321499136, 512},
+						(nccl_ofi_tuner_point_t){32212254720, 2048},
+						(nccl_ofi_tuner_point_t){TUNER_MAX_SIZE, TUNER_MAX_RANKS});
+
+			const nccl_ofi_tuner_region_t regions[] = {
+				{.algorithm = NCCL_ALGO_RING,
+					.protocol = NCCL_PROTO_LL,
+					.num_vertices = 10,
+					.vertices = {
+						{0, 16},
+						{786432, 16},
+						{1572864, 32},
+						{2621440, 64},
+						{4718592, 128},
+						{17301504, 256},
+						{74973184, 1024},
+						{213385216, 2048},
+						extended_ring_ll,
+						{0, TUNER_MAX_RANKS}}},
+				{.algorithm = NCCL_ALGO_RING,
+					.protocol = NCCL_PROTO_LL128,
+					.num_vertices = 14,
+					.vertices = {
+						extended_ring_ll,
+						{213385216, 2048},
+						{74973184, 1024},
+						{17301504, 256},
+						{4718592, 128},
+						{2621440, 64},
+						{1572864, 32},
+						{786432, 16},
+						{198705152, 16},
+						{456130560, 32},
+						{871366656, 64},
+						{8321499136, 512},
+						{32212254720, 2048},
+						extended_ring_ll128}},
+				{.algorithm = NCCL_ALGO_RING,
+					.protocol = NCCL_PROTO_SIMPLE,
+					.num_vertices = 7,
+					.vertices = {
+						extended_ring_ll128,
+						{32212254720, 2048},
+						{8321499136, 512},
+						{871366656, 64},
+						{456130560, 32},
+						{198705152, 16},
+						{TUNER_MAX_SIZE, 16}}}};
+			ret = set_regions(region_ctx, collType, sizeof(regions) / sizeof(regions[0]), regions);
+			if (ret != ncclSuccess) {
+				goto exit;
+			}
+		}
+		{
+			collType = ncclFuncReduceScatter;
+
+			nccl_ofi_tuner_point_t extended_ring_ll =
+				extend_region((nccl_ofi_tuner_point_t){73924608, 1024},
+						(nccl_ofi_tuner_point_t){209190912, 2048},
+						(nccl_ofi_tuner_point_t){TUNER_MAX_SIZE, TUNER_MAX_RANKS});
+			nccl_ofi_tuner_point_t extended_ring_ll128 =
+				extend_region((nccl_ofi_tuner_point_t){4294967296, 256},
+							(nccl_ofi_tuner_point_t){8589934592, 512},
+							(nccl_ofi_tuner_point_t){TUNER_MAX_SIZE, TUNER_MAX_RANKS});
+
+			const nccl_ofi_tuner_region_t regions[] = {
+				{.algorithm = NCCL_ALGO_RING,
+					.protocol = NCCL_PROTO_LL,
+					.num_vertices = 11,
+					.vertices = {
+						{0, 16},
+						{786432, 16},
+						{1572864, 32},
+						{2621440, 64},
+						{4718592, 128},
+						{17301504, 256},
+						{35127296, 512},
+						{73924608, 1024},
+						{209190912, 2048},
+						extended_ring_ll,
+						{0, TUNER_MAX_RANKS}}},
+				{.algorithm = NCCL_ALGO_RING,
+					.protocol = NCCL_PROTO_LL128,
+					.num_vertices = 15,
+					.vertices = {
+						extended_ring_ll,
+						{209190912, 2048},
+						{73924608, 1024},
+						{35127296, 512},
+						{17301504, 256},
+						{4718592, 128},
+						{2621440, 64},
+						{1572864, 32},
+						{786432, 16},
+						{219676672, 16},
+						{508559360, 32},
+						{592445440, 64},
+						{4294967296, 256},
+						{8589934592, 512},
+						extended_ring_ll128}},
+				{.algorithm = NCCL_ALGO_RING,
+					.protocol = NCCL_PROTO_SIMPLE,
+					.num_vertices = 6,
+					.vertices = {
+						extended_ring_ll128,
+						{4294967296, 256},
+						{592445440, 64},
+						{508559360, 32},
+						{219676672, 16},
+						{TUNER_MAX_SIZE, 16}}}};
+			ret = set_regions(region_ctx, collType, sizeof(regions) / sizeof(regions[0]), regions);
+			if (ret != ncclSuccess) {
+				goto exit;
+			}
+		}
+	} else if (nRanks == nNodes) {
+		{
+			collType = ncclFuncAllReduce;
+			const nccl_ofi_tuner_region_t regions[] = {
+				{.algorithm = NCCL_ALGO_TREE,
+				 .protocol = NCCL_PROTO_LL,
+				 .num_vertices = 5,
+				 .vertices = {{0, 2},
+						{32768, 2},
+						{32768, 128},
+						{32768, 131072},
+						{0, 131072},}},
+				{.algorithm = NCCL_ALGO_TREE,
+				 .protocol = NCCL_PROTO_LL128,
+				 .num_vertices = 6,
+				 .vertices = {{32768, 2},
+						{131072, 2},
+						{8388608, 128},
+						{8589934592, 131072},
+						{32768, 131072},
+						{32768, 128},}},
+				{.algorithm = NCCL_ALGO_RING,
+				 .protocol = NCCL_PROTO_LL128,
+				 .num_vertices = 8,
+				 .vertices = {{131072, 2},
+						{3145728, 2},
+						{297795584, 128},
+						{107374182400, 45916},
+						{107374182400, 59831},
+						{164626432, 128},
+						{20971520, 48},
+						{3145728, 48},}},
+				{.algorithm = NCCL_ALGO_TREE,
+				 .protocol = NCCL_PROTO_SIMPLE,
+				 .num_vertices = 6,
+				 .vertices = {{3145728, 48},
+						{20971520, 48},
+						{164626432, 128},
+						{107374182400, 59831},
+						{107374182400, 131072},
+						{8589934592, 131072},}},
+				{.algorithm = NCCL_ALGO_RING,
+				 .protocol = NCCL_PROTO_SIMPLE,
+				 .num_vertices = 4,
+				 .vertices = {{3145728, 2},
+						{107374182400, 2},
+						{107374182400, 45916},
+						{297795584, 128},}}};
+			ret = set_regions(region_ctx, collType, sizeof(regions) / sizeof(regions[0]), regions);
+			if (ret != ncclSuccess){
+				goto exit;
+			}
+		}
+		{
+			collType = ncclFuncAllGather;
+			const nccl_ofi_tuner_region_t regions[] = {
+				{.algorithm = NCCL_ALGO_RING,
+				 .protocol = NCCL_PROTO_LL,
+				 .num_vertices = 3,
+				 .vertices = {{0, 2},
+						{65536, 2},
+						{65536, 4},}},
+				{.algorithm = NCCL_ALGO_PAT,
+				 .protocol = NCCL_PROTO_SIMPLE,
+				 .num_vertices = 8,
+				 .vertices = {{0, 2},
+						{65536, 4},
+						{1048576, 4},
+						{12582912, 48},
+						{88080384, 48},
+						{248512512, 128},
+						{34359738368, 17137},
+						{0, 131072},}},
+				{.algorithm = NCCL_ALGO_RING,
+				 .protocol = NCCL_PROTO_LL128,
+				 .num_vertices = 11,
+				 .vertices = {{65536, 2},
+						{2097152, 2},
+						{16777216, 8},
+						{291504128, 128},
+						{34359738368, 15008},
+						{34359738368, 17137},
+						{248512512, 128},
+						{88080384, 48},
+						{12582912, 48},
+						{1048576, 4},
+						{65536, 4},}},
+				{.algorithm = NCCL_ALGO_RING,
+				 .protocol = NCCL_PROTO_SIMPLE,
+				 .num_vertices = 5,
+				 .vertices = {{2097152, 2},
+						{34359738368, 2},
+						{34359738368, 15008},
+						{291504128, 128},
+						{16777216, 8},}}};
+			ret = set_regions(region_ctx, collType, sizeof(regions) / sizeof(regions[0]), regions);
+			if (ret != ncclSuccess) {
+				goto exit;
+			}
+		}
+		{
+			collType = ncclFuncReduceScatter;
+			const nccl_ofi_tuner_region_t regions[] = {
+				{.algorithm = NCCL_ALGO_RING,
+				 .protocol = NCCL_PROTO_LL,
+				 .num_vertices = 3,
+				 .vertices = {{0, 2},
+						{65536, 2},
+						{65536, 4},}},
+				{.algorithm = NCCL_ALGO_PAT,
+				 .protocol = NCCL_PROTO_SIMPLE,
+				 .num_vertices = 7,
+				 .vertices = {{0, 2},
+						{65536, 4},
+						{1048576, 4},
+						{67108864, 48},
+						{106954752, 48},
+						{274877906944, 121928},
+						{0, 131072},}},
+				{.algorithm = NCCL_ALGO_RING,
+				 .protocol = NCCL_PROTO_LL128,
+				 .num_vertices = 7,
+				 .vertices = {{65536, 2},
+						{2097152, 2},
+						{16777216, 8},
+						{106954752, 48},
+						{67108864, 48},
+						{1048576, 4},
+						{65536, 4},}},
+				{.algorithm = NCCL_ALGO_RING,
+				 .protocol = NCCL_PROTO_SIMPLE,
+				 .num_vertices = 5,
+				 .vertices = {{2097152, 2},
+						{274877906944, 2},
+						{274877906944, 121928},
+						{106954752, 48},
+						{16777216, 8},}}};
+			ret = set_regions(region_ctx, collType, sizeof(regions) / sizeof(regions[0]), regions);
+			if (ret != ncclSuccess) {
+				goto exit;
+			}
+		}
+	}
+exit:
+	return ret;
+}
+
+
+static uint64_t calculateChunkSizeTreeLL128(uint64_t message_size, int nChannels, int log2_nnodes)
+{
+	const int ppn = 8;
+	/* Initial Buffer Size */
+	uint64_t buffSize = NCCL_OFI_TUNER_NCCL_LL128_ELEMS_PER_THREAD *
+		NCCL_OFI_TUNER_NCCL_LL128_MAX_NTHREADS *
+		NCCL_OFI_TUNER_NCCL_STEPS * sizeof(uint64_t);
+
+	uint64_t stepSize = buffSize / NCCL_OFI_TUNER_NCCL_STEPS;
+	uint64_t chunkSize = stepSize;
+
+	/* Adjust for Protocol Overhead */
+	chunkSize = (chunkSize / NCCL_OFI_TUNER_NCCL_LL128_LINEELEMS) * NCCL_OFI_TUNER_NCCL_LL128_DATAELEMS;
+
+	/* Estimate the number of communication steps needed for the tree algorithm,
+	 * based on the logarithmic nature of tree reduction (log2 of nodes) plus a
+	 * small factor for processes per node (ppn) */
+	double nStepsLL128 = 1 + log2_nnodes + 0.1 * ppn;
+
+	/* Reduce chunk size when the message doesn't provide enough work per communication step
+	 * The ratios (64/ppn and 16/ppn) ensure sufficient parallelism - if there aren't enough
+	 * chunks to keep all processes busy during the tree steps, the chunk size is halved */
+	while (message_size/(nChannels*chunkSize) < nStepsLL128*64/ppn &&
+		chunkSize > 131072) {
+		chunkSize /= 2;
+	}
+	while (message_size/(nChannels*chunkSize) < nStepsLL128*16/ppn &&
+		chunkSize > 32768) {
+		chunkSize /= 2;
+	}
+
+	/* Calculate the protocol grain size (minimum processing unit) and aligns the chunk size to it.
+	 * The grain size represents how much data a warp processes efficiently in the LL128 protocol. */
+	uint64_t grainSize = (NCCL_OFI_TUNER_NCCL_WARP_SIZE * NCCL_OFI_TUNER_NCCL_LL128_SHMEM_ELEMS_PER_THREAD /
+		NCCL_OFI_TUNER_NCCL_LL128_LINEELEMS * NCCL_OFI_TUNER_NCCL_LL128_DATAELEMS * sizeof(uint64_t));
+	chunkSize = (chunkSize / grainSize) * grainSize;
+
+	uint64_t elementsPerGrain = grainSize / sizeof(float);
+	uint64_t chunkGrain = chunkSize / grainSize;
+	uint64_t nelem = chunkGrain * elementsPerGrain;
+
+	/* Wire format calculation
+	 * Convert from logical elements to the actual wire format size, accounting for the LL128 line structure
+	 * where some words are used for flags.
+	 * WireWordPerSlice defines the number of 64-bit words transmitted per slice in the LL128 protocol */
+	uint64_t WireWordPerSlice = NCCL_OFI_TUNER_NCCL_WARP_SIZE * NCCL_OFI_TUNER_NCCL_LL128_SHMEM_ELEMS_PER_THREAD;
+	/* DataEltPerSlice represents the actual data elements per slice after accounting for LL128's flag overhead: */
+	uint64_t DataEltPerSlice = (WireWordPerSlice - WireWordPerSlice/NCCL_OFI_TUNER_NCCL_LL128_LINEELEMS) * (sizeof(uint64_t)/sizeof(float));
+
+	uint64_t final_chunksize = ceil(static_cast<double>(nelem)/DataEltPerSlice) *
+		WireWordPerSlice * sizeof(uint64_t);
+
+	return final_chunksize;
+}
+
+/*
+* Calculate the best number of channel for PAT. Based on empirical data.
+*/
+static int calculateBestNChannelPat(uint64_t message_size, size_t num_nodes) {
+	int bestNChannel = 0;
+
+	if (message_size <= (num_nodes * 65536)) {
+		bestNChannel = 1;
+	} else if (message_size <= (num_nodes * 65536 * 2)) {
+		bestNChannel = 2;
+	}
+
+	return bestNChannel;
+}
+
+static int calculateBestNChannelTree(uint64_t message_size, int log2_nnodes) {
+    const int channels[] = {16, 24, 32};
+    int bestNChannel = 0;
+    uint64_t maxChunkSize = 0;
+
+    for (int channel : channels) {
+        uint64_t payload = calculateChunkSizeTreeLL128(message_size, channel, log2_nnodes);
+
+        /* Update if payload is larger, or equal but with a larger channel number */
+        if (payload > maxChunkSize || (payload == maxChunkSize && channel > bestNChannel)) {
+            maxChunkSize = payload;
+            bestNChannel = channel;
+        }
+    }
+
+    return bestNChannel;
+}
+
+
 /*****************************************************************************
  *****************************************************************************
  *        functions that are called by common tuner code start here
@@ -907,7 +1411,7 @@ exit:
 
 bool is_region_supported(enum nccl_ofi_tuner_platform platform, size_t nRanks, size_t nNodes)
 {
-	if (platform == NCCL_OFI_TUNER_P5_P5E || platform == NCCL_OFI_TUNER_P5EN) {
+	if (platform == NCCL_OFI_TUNER_P5_P5E || platform == NCCL_OFI_TUNER_P5EN || platform == NCCL_OFI_TUNER_P6) {
 		return true;
 	}
 
@@ -945,6 +1449,7 @@ ncclResult_t region_get_coll_info_internal_v2(nccl_ofi_tuner_context_t *ctx,
 
 	p.x = (double)nBytes;
 	p.y = (double)region_ctx->dims.num_ranks;
+	p.transform_log2_x();
 
 	/* Check all regions */
 	for (size_t i = 0; i < region_ctx->num_regions[collType] && in_out < 0; i++) {
@@ -1009,9 +1514,10 @@ ncclResult_t region_get_coll_info_internal_v3(nccl_ofi_tuner_context_t *ctx,
 		ret = ncclSuccess;
 		goto exit;
 	}
-	
+
 	p.x = (double)nBytes;
 	p.y = (double)region_ctx->dims.num_ranks;
+	p.transform_log2_x();
 
 	/* Check all regions */
 	for (size_t i = 0; i < region_ctx->num_regions[collType] && in_out < 0; i++) {
@@ -1040,8 +1546,29 @@ ncclResult_t region_get_coll_info_internal_v3(nccl_ofi_tuner_context_t *ctx,
 
 	if (in_out < 0) {
 		NCCL_OFI_INFO(NCCL_TUNING, "Falling back to NCCL's tuner for coll %d size %ld.", collType, nBytes);
+		goto exit;
 	}
 
+	/* On P6 platform and only for TreeLL128 AR 0x0, we pick best nChannels that
+	 * results in largest chunkSize at 4-32MB. When same chunkSize is achieved with
+	 * different nChannels, we pick the largest nChannels. This is a general pattern
+	 * we validated with data that seen performance improvements, but with a few
+	 * message sizes being the outliers. */
+	if ((region_ctx->platform == NCCL_OFI_TUNER_P6) &&
+	    (nBytes >= 4 * 1024 * 1024) && (nBytes <= 32 * 1024 * 1024) &&
+	    (algorithm == NCCL_ALGO_TREE) && (protocol == NCCL_PROTO_LL128) &&
+	    (region_ctx->dims.num_nodes * 8 == region_ctx->dims.num_ranks)) {
+		*nChannels = calculateBestNChannelTree(nBytes, region_ctx->log2_nnodes);
+	}
+
+	/* Selecting best nChannels for P6 platform PAT AG/RS 0x7 */
+	if ((region_ctx->platform == NCCL_OFI_TUNER_P6) && (nBytes <= 32 * 1024 * 1024) &&
+		(algorithm == NCCL_ALGO_PAT) && (protocol == NCCL_PROTO_SIMPLE) &&
+		(region_ctx->dims.num_nodes == region_ctx->dims.num_ranks)) {
+		*nChannels = calculateBestNChannelPat(nBytes, region_ctx->dims.num_nodes);
+	}
+
+	NCCL_OFI_INFO(NCCL_TUNING, "Setting nChannels to %d at nBytes=%ld.", *nChannels, nBytes);
 exit:
 	return ret;
 }
@@ -1078,6 +1605,7 @@ ncclResult_t region_init_internal(nccl_ofi_tuner_context_t *ctx, enum nccl_ofi_t
 	region_ctx->dims.num_ranks = nRanks;
 	region_ctx->dims.num_nodes = nNodes;
 	region_ctx->platform = platform;
+	region_ctx->log2_nnodes = log2i(nNodes);
 
 	/* Define regions where a certain combination of algorithm and protocol
 	 * should be used. Any point not covered by any region would fall back
@@ -1088,6 +1616,8 @@ ncclResult_t region_init_internal(nccl_ofi_tuner_context_t *ctx, enum nccl_ofi_t
 		ret = region_init_internal_p5_p5e(region_ctx);
 	} else if (platform == NCCL_OFI_TUNER_P5EN) {
 		ret = region_init_internal_p5en(region_ctx);
+	} else if (platform == NCCL_OFI_TUNER_P6) {
+		ret = region_init_internal_p6(region_ctx);
 	} else {
 		ret = ncclInternalError;
 		goto exit;

@@ -21,6 +21,7 @@
 #include "nccl_ofi_ofiutils.h"
 #include "nccl_ofi_platform.h"
 
+
 #define EFA_PROVIDER_NAME "efa"
 #define IS_EFA_PROVIDER(NAME) (strcmp((NAME), EFA_PROVIDER_NAME)==0)
 
@@ -69,7 +70,7 @@ static bool prov_filter_tcp_interfaces(struct fi_info *provider, const void *dat
 	   providers */
         if (0 != strncmp(provider->fabric_attr->prov_name, "tcp", strlen("tcp"))) {
 		return true;
-	} else if (in_list(provider->domain_attr->name, ofi_nccl_exclude_tcp_if()) == 0) {
+	} else if (in_list(provider->domain_attr->name, ofi_nccl_exclude_tcp_if().c_str()) == 0) {
 		return true;
 	}
 
@@ -219,42 +220,78 @@ int nccl_ofi_ofiutils_get_providers(const char *prov_include,
 }
 
 
-int nccl_ofi_ofiutils_init_connection(struct fi_info *info, struct fid_domain *domain,
-				      struct fid_ep **ep, struct fid_av **av, struct fid_cq *cq)
+/**
+ * @brief	Create and initialize libfabric fabric
+ */
+ofi_fabric_result nccl_ofi_ofiutils_fabric_create(struct fi_info *info)
 {
 	int ret = 0;
-	struct fi_av_attr av_attr = {};
+	struct fid_fabric *raw_fabric = nullptr;
+
+	ret = fi_fabric(info->fabric_attr, &raw_fabric, NULL);
+	if (OFI_UNLIKELY(ret != 0)) {
+		NCCL_OFI_WARN("Couldn't create fabric. RC: %d, ERROR: %s",
+			      ret, fi_strerror(-ret));
+		return ofi_fabric_result(ret);
+	}
+
+	return ofi_fabric_result(make_ofi_fabric_ptr(raw_fabric));
+}
+
+
+/**
+ * @brief	Create and initialize libfabric domain
+ */
+ofi_domain_result nccl_ofi_ofiutils_domain_create(ofi_fabric_ptr &fabric, struct fi_info *info)
+{
+	int ret = 0;
+	struct fid_domain *raw_domain = nullptr;
+
+	ret = fi_domain(fabric.get(), info, &raw_domain, NULL);
+	if (OFI_UNLIKELY(ret != 0)) {
+		NCCL_OFI_WARN("Couldn't create domain. RC: %d, ERROR: %s",
+			      ret, fi_strerror(-ret));
+		return ofi_domain_result(ret);
+	}
+
+	return ofi_domain_result(make_ofi_domain_ptr(raw_domain));
+}
+
+
+/**
+ * @brief	Create and initialize libfabric endpoint
+ */
+ofi_ep_result nccl_ofi_ofiutils_ep_create(struct fi_info *info, ofi_domain_ptr &domain,
+					  ofi_av_ptr &av, ofi_cq_ptr &cq)
+{
+	int ret = 0;
+	struct fid_ep *raw_ep = nullptr;
 
 	/* Create transport level communication endpoint(s) */
-	ret = fi_endpoint(domain, info, ep, NULL);
+	ret = fi_endpoint(domain.get(), info, &raw_ep, NULL);
 	if (OFI_UNLIKELY(ret != 0)) {
 		NCCL_OFI_WARN("Couldn't allocate endpoint. RC: %d, ERROR: %s",
 			      ret, fi_strerror(-ret));
-		goto error;
+		return ofi_ep_result(ret);
 	}
 
-	/* Open AV */
-	ret = fi_av_open(domain, &av_attr, av, NULL);
-	if (OFI_UNLIKELY(ret != 0)) {
-		NCCL_OFI_WARN("Couldn't open AV. RC: %d, ERROR: %s",
-			      ret, fi_strerror(-ret));
-		goto error;
-	}
+	/* Immediately wrap in RAII for automatic cleanup on any error */
+	auto ep_ptr = make_ofi_ep_ptr(raw_ep);
 
 	/* Bind CQ to endpoint */
-	ret = fi_ep_bind(*ep, &(cq->fid), FI_SEND | FI_RECV);
+	ret = fi_ep_bind(ep_ptr.get(), &(cq->fid), FI_TRANSMIT | FI_RECV);
 	if (OFI_UNLIKELY(ret != 0)) {
 		NCCL_OFI_WARN("Couldn't bind EP-CQ. RC: %d, ERROR: %s",
 			      ret, fi_strerror(-ret));
-		goto error;
+		return ofi_ep_result(ret);
 	}
 
 	/* Bind AV to endpoint */
-	ret = fi_ep_bind(*ep, &((*av)->fid), 0);
+	ret = fi_ep_bind(ep_ptr.get(), &(av->fid), 0);
 	if (OFI_UNLIKELY(ret != 0)) {
 		NCCL_OFI_WARN("Couldn't bind EP-AV. RC: %d, ERROR: %s",
 			      ret, fi_strerror(-ret));
-		goto error;
+		return ofi_ep_result(ret);
 	}
 
 	/*
@@ -275,7 +312,7 @@ int nccl_ofi_ofiutils_init_connection(struct fi_info *info, struct fid_domain *d
 #if HAVE_DECL_FI_OPT_SHARED_MEMORY_PERMITTED
 	{
 		bool optval = false;
-		ret = fi_setopt(&(*ep)->fid, FI_OPT_ENDPOINT,
+		ret = fi_setopt(&ep_ptr->fid, FI_OPT_ENDPOINT,
 				FI_OPT_SHARED_MEMORY_PERMITTED, &optval,
 				sizeof(optval));
 		if (ret == -FI_EOPNOTSUPP || ret == -FI_ENOPROTOOPT) {
@@ -289,7 +326,7 @@ int nccl_ofi_ofiutils_init_connection(struct fi_info *info, struct fid_domain *d
 		} else if (ret != 0) {
 			NCCL_OFI_WARN("Disabling shared memory failed: %s",
 				      fi_strerror(-ret));
-			goto error;
+			return ofi_ep_result(ret);
 		}
 	}
 #endif
@@ -309,7 +346,7 @@ int nccl_ofi_ofiutils_init_connection(struct fi_info *info, struct fid_domain *d
 			  FI_VERSION(1, 18)) && support_gdr != GDR_UNSUPPORTED) {
 #if (HAVE_CUDA && HAVE_DECL_FI_OPT_CUDA_API_PERMITTED)
 		bool optval = false;
-		ret = fi_setopt(&(*ep)->fid, FI_OPT_ENDPOINT,
+		ret = fi_setopt(&ep_ptr->fid, FI_OPT_ENDPOINT,
 				FI_OPT_CUDA_API_PERMITTED, &optval,
 				sizeof(optval));
 		if (ret == -FI_EOPNOTSUPP || ret == -FI_ENOPROTOOPT) {
@@ -320,7 +357,7 @@ int nccl_ofi_ofiutils_init_connection(struct fi_info *info, struct fid_domain *d
 				 * support GDR, we should just abort.
 				 */
 				NCCL_OFI_WARN("GDR support reported to NCCL but then couldn't be configured on an endpoint.  Cannot continue.");
-				goto error;
+				return ofi_ep_result(ret);
 			} else {
 				NCCL_OFI_INFO(NCCL_INIT | NCCL_NET, "Could not disable CUDA API usage for HMEM, disabling GDR");
 				/* If we can't disable CUDA, then we don't really
@@ -336,7 +373,7 @@ int nccl_ofi_ofiutils_init_connection(struct fi_info *info, struct fid_domain *d
 		} else {
 			NCCL_OFI_WARN("Failed to set FI_OPT_CUDA_API_PERMITTED. RC: %d, ERROR: %s",
 				      ret, fi_strerror(-ret));
-			goto error;
+			return ofi_ep_result(ret);
 		}
 #elif HAVE_NEURON
 		/*
@@ -347,52 +384,103 @@ int nccl_ofi_ofiutils_init_connection(struct fi_info *info, struct fid_domain *d
 		 * to supported.
 		 */
 		support_gdr = GDR_SUPPORTED;
+#elif HAVE_ROCM
+		/*
+		 * ROCm does not require FI_OPT_CUDA_API_PERMITTED.
+		 */
+		support_gdr = GDR_SUPPORTED;
 #else
 		NCCL_OFI_WARN("Using Libfabric 1.18 API with GPUDirect RDMA support, and FI_OPT_CUDA_API_PERMITTED is not declared.");
 		ret = -EOPNOTSUPP;
-		goto error;
+		return ofi_ep_result(ret);
 #endif
 	}
-	/* Run platform-specific endpoint configuration hook if declared */
-	if (platform_config_endpoint) {
-		ret = platform_config_endpoint(info, *ep);
-		if (ret != 0)
-			goto error;
+	/* Run platform-specific endpoint configuration hook */
+	ret = PlatformManager::get_global().get_platform().config_endpoint(info, ep_ptr.get());
+	if (ret != 0) {
+		return ofi_ep_result(ret);
 	}
 
 	/* Enable endpoint for communication */
-	ret = fi_enable(*ep);
+	ret = fi_enable(ep_ptr.get());
 	if (OFI_UNLIKELY(ret != 0)) {
 		NCCL_OFI_WARN("Couldn't enable endpoint. RC: %d, ERROR: %s",
 			      ret, fi_strerror(-ret));
-		goto error;
+		return ofi_ep_result(ret);
 	}
 
-	return ret;
- error:
-	if (*ep) {
-		fi_close((fid_t)*ep);
-		*ep = NULL;
-	}
-
-	if (*av) {
-		fi_close((fid_t)*av);
-		*av = NULL;
-	}
-
-	return ret;
+	return ofi_ep_result(std::move(ep_ptr));
 }
 
-/*
+
+/**
+ * @brief	Create and initialize libfabric address vector
+ */
+ofi_av_result nccl_ofi_ofiutils_av_create(ofi_domain_ptr &domain)
+{
+	int ret = 0;
+	struct fi_av_attr av_attr = {};
+	struct fid_av *raw_av = nullptr;
+
+	/* Open AV */
+	ret = fi_av_open(domain.get(), &av_attr, &raw_av, NULL);
+	if (OFI_UNLIKELY(ret != 0)) {
+		NCCL_OFI_WARN("Couldn't open AV. RC: %d, ERROR: %s",
+			      ret, fi_strerror(-ret));
+		return ofi_av_result(ret);
+	}
+
+	return ofi_av_result(make_ofi_av_ptr(raw_av));
+}
+
+
+/**
+ * @brief	Create and initialize libfabric completion queue
+ */
+ofi_cq_result nccl_ofi_ofiutils_cq_create(ofi_domain_ptr &domain, struct fi_cq_attr *cq_attr)
+{
+	int ret = 0;
+	struct fid_cq *raw_cq = nullptr;
+
+	ret = fi_cq_open(domain.get(), cq_attr, &raw_cq, NULL);
+	if (OFI_UNLIKELY(ret != 0)) {
+		NCCL_OFI_WARN("Couldn't create completion queue. RC: %d, ERROR: %s",
+			      ret, fi_strerror(-ret));
+		return ofi_cq_result(ret);
+	}
+
+	return ofi_cq_result(make_ofi_cq_ptr(raw_cq));
+}
+
+
+/**
+ * @brief	Register memory region with libfabric using fi_mr_regattr
+ */
+ofi_mr_result nccl_ofi_ofiutils_mr_regattr(ofi_domain_ptr &domain, 
+					   struct fi_mr_attr *mr_attr, 
+					   uint64_t flags)
+{
+	int ret = 0;
+	struct fid_mr *raw_mr = nullptr;
+
+	ret = fi_mr_regattr(domain.get(), mr_attr, flags, &raw_mr);
+	if (OFI_UNLIKELY(ret != 0)) {
+		NCCL_OFI_WARN("Couldn't register memory region with regattr. RC: %d, ERROR: %s",
+			      ret, fi_strerror(-ret));
+		return ofi_mr_result(ret);
+	}
+
+	return ofi_mr_result(make_ofi_mr_ptr(raw_mr));
+}
+
+
+/**
  * @brief	Release libfabric endpoint, address vector, and completion queue
  */
-void nccl_ofi_ofiutils_ep_release(struct fid_ep *ep, struct fid_av *av, int dev_id)
+void nccl_ofi_ofiutils_ep_release(ofi_ep_ptr& ep, ofi_av_ptr& av, int dev_id)
 {
-	if (ep)
-		fi_close((fid_t)ep);
-
-	if (av)
-		fi_close((fid_t)av);
+	ep.reset();
+	av.reset();
 
 	NCCL_OFI_TRACE(NCCL_NET, "Libfabric endpoint and address vector of dev #%d is released", dev_id);
 }
@@ -402,26 +490,11 @@ void nccl_ofi_ofiutils_ep_release(struct fid_ep *ep, struct fid_av *av, int dev_
  */
 int nccl_ofi_mr_keys_need_own_key(struct fi_info* provider, bool *provide_own_mr_key)
 {
-	if (!(provider->caps & FI_RMA)) {
-		/* When FI_RMA is not requested, Libfabric considers
-		   memory registrations to be local only, and
-		   therefore the requested_key field is ignored and
-		   (unfortunately) a random key may be returned from
-		   fi_mr_key().  This totally screws up the code to
-		   provide a unique MR key, which is, according to
-		   Libfabric, unnecessary in this mode anyway, so fall
-		   back to the provider-specified key code, which
-		   should behave properly in either case. */
-		NCCL_OFI_TRACE(NCCL_INIT | NCCL_NET, "Provider %s only configured for local registration.",
-			       provider->fabric_attr->prov_name);
-		*provide_own_mr_key = false;
-	}
-	else if (provider->domain_attr->mr_mode & FI_MR_PROV_KEY) {
+	if (provider->domain_attr->mr_mode & FI_MR_PROV_KEY) {
 		NCCL_OFI_TRACE(NCCL_INIT | NCCL_NET, "Provider %s selects memory registration keys",
 			       provider->fabric_attr->prov_name);
 		*provide_own_mr_key = false;
-	}
-	else {
+	} else {
 		NCCL_OFI_TRACE(NCCL_INIT | NCCL_NET, "Provider %s does not select memory registration keys",
 			       provider->fabric_attr->prov_name);
 		*provide_own_mr_key = true;

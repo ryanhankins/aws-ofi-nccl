@@ -8,12 +8,14 @@
 
 if ENABLE_UNIT_TESTS
 AM_CPPFLAGS = -I$(top_srcdir)/include
+AM_CPPFLAGS += -isystem $(abs_top_srcdir)/3rd-party
 AM_CPPFLAGS += -isystem $(abs_top_srcdir)/3rd-party/nccl/$(DEVICE_INTERFACE)/include
-AM_CPPFLAGS += -isystem $(abs_top_srcdir)/3rd-party/uthash/include
-LDADD = $(top_builddir)/src/libinternal_net_plugin.la
-noinst_HEADERS = test-common.h
+LDADD = $(top_builddir)/src/libinternal_plugin.la
+noinst_HEADERS = test-logger.h
 
 noinst_PROGRAMS = \
+	assert \
+	environ \
 	freelist \
 	msgbuff \
 	scheduler \
@@ -21,7 +23,10 @@ noinst_PROGRAMS = \
 	ep_addr_list \
 	mr \
 	histogram_binner \
-	histogram
+	histogram \
+	dlopen_c_test \
+	param \
+	platform_manager
 
 if WANT_PLATFORM_AWS
 noinst_PROGRAMS += aws_platform_mapper
@@ -34,10 +39,11 @@ if WANT_PLATFORM_AWS
   LDADD += $(CUDA_LIBS)
   noinst_PROGRAMS += region_based_tuner
   region_based_tuner_SOURCES = region_based_tuner.cpp
-  region_based_tuner_LDADD = $(top_builddir)/src/libinternal_tuner_plugin.la
 endif
 endif
 
+assert_SOURCES = assert.cpp
+environ_SOURCES = environ.cpp
 idpool_SOURCES = idpool.cpp
 freelist_SOURCES = freelist.cpp
 msgbuff_SOURCES = msgbuff.cpp
@@ -47,6 +53,9 @@ mr_SOURCES = mr.cpp
 aws_platform_mapper_SOURCES = aws_platform_mapper.cpp
 histogram_binner_SOURCES = histogram_binner.cpp
 histogram_SOURCES = histogram.cpp
+dlopen_c_test_SOURCES = dlopen_c_test.c
+param_SOURCES = param.cpp
+platform_manager_SOURCES = platform_manager.cpp
 
 TESTS = $(noinst_PROGRAMS)
 endif

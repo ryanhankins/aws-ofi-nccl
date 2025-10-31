@@ -8,7 +8,8 @@
 
 #include "nccl_ofi_msgbuff.h"
 
-#include "test-common.h"
+#include "nccl_ofi.h"
+#include "test-logger.h"
 
 int main(int argc, char *argv[])
 {
@@ -29,7 +30,7 @@ int main(int argc, char *argv[])
 	}
 
 	nccl_ofi_msgbuff_t *msgbuff;
-	if (!(msgbuff = nccl_ofi_msgbuff_init(max_inprogress, num_msg_seq_num_bits))) {
+	if (!(msgbuff = nccl_ofi_msgbuff_init(max_inprogress, num_msg_seq_num_bits, 0))) {
 		NCCL_OFI_WARN("nccl_ofi_msgbuff_init failed");
 		return 1;
 	}

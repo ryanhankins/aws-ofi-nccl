@@ -20,8 +20,21 @@
 #include "nccl_ofi_ofiutils.h"
 #include "nccl_ofi_platform.h"
 
-static const uint8_t target_class_id = 0x03;		/* Display controller class */
-static const unsigned short target_vendor_id = 0x10de;	/* NVIDIA */
+#if HAVE_CUDA
+static const uint8_t target_class_ids[] = { 0x03 };           /* Display controller class */
+static const unsigned short target_vendor_ids[] = { 0x10de }; /* NVIDIA */
+#elif HAVE_ROCM
+// AMD GPUs can appear as either "Display controller" or "Processing accelerator"
+static const uint8_t target_class_ids[] = { 0x03, 0x12 };
+static const unsigned short target_vendor_ids[] = { 0x1002 }; /* AMD */
+#elif HAVE_NEURON
+// No multi-rail grouping for neuron, pick an invalid class and vendor so that
+// no devices will be found.
+static const uint8_t target_class_ids[] = { 0 };
+static const unsigned short target_vendor_ids[] = { 0 };
+#else
+#error "No target device pcie information available"
+#endif
 
 /* Maximum length of the device property read from file by function
  * get_device_property() */
@@ -31,7 +44,7 @@ const char *speed_name = "max_link_speed";
 const char *width_name = "max_link_width";
 
 /* `pcie_gen[i]` defines the speed of a PCIe lane of PCIe generation `i+1` */
-const char *pcie_gen[] = {"2.5", "5", "8", "16", "32", "64"};
+const char *pcie_gen[] = {"2.5", "5.0", "8.0", "16.0", "32.0", "64.0"};
 
 /*
  * @brief Create vector of nccl_ofi_topo_data_t structs
@@ -158,8 +171,22 @@ static int is_accelerator_dev(hwloc_obj_t obj, bool *res)
 	   the class code. */
 	class_code = obj->attr->pcidev.class_id >> 8;
 
-	class_match = target_class_id == class_code;
-	vendor_match = obj->attr->pcidev.vendor_id == target_vendor_id;
+	class_match = false;
+	for (size_t i = 0 ; i < sizeof(target_class_ids) / sizeof(target_class_ids[0]) ; i++) {
+		if (target_class_ids[i] == class_code) {
+			class_match = true;
+			break;
+		}
+	}
+
+	vendor_match = false;
+	for (size_t i = 0 ; i < sizeof(target_vendor_ids) / sizeof(target_vendor_ids[0]) ; i++) {
+		if (target_vendor_ids[i] == obj->attr->pcidev.vendor_id) {
+			vendor_match = true;
+			break;
+		}
+	}
+
         *res = class_match && vendor_match;
         return 0;
 }
@@ -294,6 +321,52 @@ static int get_hwloc_pcidev_by_fi_info(hwloc_topology_t topo,
 }
 
 /*
+ * brief	Checks if PCI device node has any accelerators at the same level
+ *
+ * Iterate through the parent PCI tree and returns true if there are any
+ * accelerators are at the same PCI level
+ *
+ * @param	node
+ *		The node
+ *
+ * @return	true if there is an accel at same level else returns false
+ */
+static bool has_accel_at_same_level(hwloc_obj_t node)
+{
+	hwloc_topology_t __unused_topo_arg = {};
+	hwloc_obj_t parent = node->parent->parent;
+	hwloc_obj_t child = NULL;
+	bool is_accel = false;
+
+	while ((child = hwloc_get_next_child(__unused_topo_arg, parent, child)) != NULL) {
+		/*
+		 * Check if child is a PCI bridge
+		 */
+		if (child->type == HWLOC_OBJ_BRIDGE &&
+			child->attr->bridge.upstream_type == HWLOC_OBJ_BRIDGE_PCI) {
+			/*
+			 * Check the devices under this bridge if any of them is an accelerator
+			 */
+			hwloc_obj_t bridge_child = hwloc_get_next_child(__unused_topo_arg, child, NULL);
+			if (bridge_child && bridge_child->type == HWLOC_OBJ_PCI_DEVICE) {
+
+				int ret = is_accelerator_dev(bridge_child, &is_accel);
+				if (ret != 0) {
+					NCCL_OFI_WARN("Error while checking whether hwloc topology node is an accelerator");
+					return false;
+				}
+
+				if (is_accel) {
+					return true;
+				}
+			}
+		}
+	}
+
+	return false;
+}
+
+/*
  * @brief	Return libfabric NIC info struct from info list that corresponds to input topology node
  *
  * @param	node
@@ -323,6 +396,14 @@ static int get_info_for_node(hwloc_obj_t node, struct fi_info *info_list, struct
 	}
 
 	if (node->type != HWLOC_OBJ_PCI_DEVICE) {
+		return 0;
+	}
+
+	/*
+	 * Check if we want to skip nics which do not have accelerators at the
+	 * same pcie level
+	 */
+	if (ofi_nccl_skip_nics_without_accel.get() && !has_accel_at_same_level(node)) {
 		return 0;
 	}
 
@@ -536,10 +617,8 @@ static int set_user_data(nccl_ofi_topo_t *ofi_topo,
 	return 0;
 }
 
-nccl_ofi_topo_t *nccl_ofi_topo_create(struct fi_info *info_list)
+nccl_ofi_topo_t *nccl_ofi_topo_create()
 {
-	int ret = 0;
-
 	/* Allocate NCCL OFI topology */
 	nccl_ofi_topo_t *ofi_topo = (nccl_ofi_topo_t *)calloc(1, sizeof(nccl_ofi_topo_t));
 	if (!ofi_topo) {
@@ -563,20 +642,32 @@ nccl_ofi_topo_t *nccl_ofi_topo_create(struct fi_info *info_list)
 		goto error;
 	}
 
+	return ofi_topo;
+
+ error:
+	nccl_ofi_topo_free(ofi_topo);
+	return NULL;
+}
+
+int nccl_ofi_topo_populate(nccl_ofi_topo_t *ofi_topo, struct fi_info *info_list)
+{
+	int ret = 0;
+
+	if (!ofi_topo) {
+		NCCL_OFI_WARN("Invalid topology");
+		return -EINVAL;
+	}
+
 	/* Add user data to topology nodes that have a nic or NVIDIA
 	 * GPU in their subtree. Also, add libfabric NIC info structs
 	 * to user data to topology nodes corresponding to the NICs. */
 	ret = set_user_data(ofi_topo, info_list);
 	if (ret != 0) {
 		NCCL_OFI_WARN("Data decoration failed.");
-		goto error;
+		return ret;
 	}
 
-	return ofi_topo;
-
- error:
-	nccl_ofi_topo_free(ofi_topo);
-	return NULL;
+	return 0;
 }
 
 /*
@@ -809,13 +900,11 @@ static int create_groups_from_info_list(nccl_ofi_topo_t *topo,
 	int group_size = num_infos / num_groups + 1;
 
 	/* sort the provider list to match network rail ordering.  See
-	 * the documentation comment for platform_sort_rails() for
+	 * the documentation comment for Platform::sort_rails() for
 	 * more information.  We do this here so that there is
 	 * consistency
 	 */
-	if (platform_sort_rails != NULL) {
-		platform_sort_rails(info_list, (size_t)num_infos, (size_t)group_size);
-	}
+	PlatformManager::get_global().get_platform().sort_rails(info_list, (size_t)num_infos, (size_t)group_size);
 
 	for (; group_idx < num_groups; ++group_idx) {
 		hwloc_obj_t obj;
@@ -1350,7 +1439,7 @@ static int write_pci_tag(FILE *file, int indent,
 			 "%*s"
 			 "<pci "
 			 "busid=\"%04x:%02x:%02x.%01x\" "
-			 "link_speed=\"%s GT/s PCIe/s\" "
+			 "link_speed=\"%s GT/s PCIe\" "
 			 "link_width=\"%zu\"/>\n",
 			 indent,
 			 "",
@@ -1669,4 +1758,36 @@ struct fi_info *nccl_ofi_topo_next_info_list(nccl_ofi_topo_data_iterator_t *iter
 	}
 
 	return info_list;
+}
+
+bool nccl_ofi_topo_has_efa_ena_devices(nccl_ofi_topo_t* topo) {
+	if (topo == nullptr || topo->topo == nullptr) {
+		return false;
+	}
+
+	hwloc_obj_t obj = nullptr;
+	while ((obj = hwloc_get_next_pcidev(topo->topo, obj)) != nullptr) {
+		// Check Amazon vendor id
+		if (obj->attr->pcidev.vendor_id == 0x1D0F) {
+			auto device_id = obj->attr->pcidev.device_id;
+
+			// Check EFA and ENA devices
+			if ((device_id & 0xFFF0) == 0xEFA0 ||
+				(device_id & 0xFFF0) == 0xEC20) {
+				return true;
+			}
+
+			// Explicit check reserved EC2 device ids
+			switch (device_id) {
+				case 0x0EC2:
+				case 0x1EC2:
+				case 0x2EC2:
+				case 0x3EC2:
+					return true;
+				default:
+					break;
+			}
+		}
+	}
+	return false;
 }

@@ -1,4 +1,6 @@
+assert
 aws_platform_mapper
+environ
 ep_addr_list
 freelist
 idpool
@@ -8,3 +10,6 @@ region_based_tuner
 scheduler
 histogram
 histogram_binner
+dlopen_c_test
+param
+platform_manager
