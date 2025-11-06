@@ -670,10 +670,10 @@ typedef struct nccl_net_ofi_rdma_recv_comm {
 	nccl_ofi_msgbuff_t *msgbuff;
 
 	/* Free list to track control buffers, for sending RDMA control messages */
-	nccl_ofi_freelist_t *ctrl_buff_fl;
+	freelist_with_ctx_t ctrl_buff;
 
 	/* Free list to track host flush buffers, for sending flush messages */
-	nccl_ofi_freelist_t *flush_buff_fl;
+	freelist_with_ctx_t flush_buff;
 
 #if HAVE_NVTX_TRACING
 	nvtxDomainHandle_t nvtx_domain[NCCL_OFI_N_NVTX_DOMAIN_PER_COMM];
@@ -1231,9 +1231,9 @@ public:
 	pthread_mutex_t pending_reqs_lock;
 
 	/* Free list of ctrl rx buffers */
-	nccl_ofi_freelist_t *ctrl_rx_buff_fl = nullptr;
+	freelist_with_ctx_t ctrl_rx_buff;
 	/* Free list of eager rx buffers */
-	nccl_ofi_freelist_t *eager_rx_buff_fl = nullptr;
+	freelist_with_ctx_t eager_rx_buff;
 	/* Free list of rx buffer requests */
 	nccl_ofi_freelist_t *rx_buff_reqs_fl = nullptr;
 	/* Size of ctrl rx buffers */
