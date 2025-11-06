@@ -4341,7 +4341,8 @@ static nccl_net_ofi_rdma_recv_comm_t *prepare_recv_comm(nccl_net_ofi_rdma_domain
 
 	nccl_net_ofi_rdma_mr_handle_t *mr_handle;
 
-	ret = domain->reg_internal_mr(r_comm->ctrl_mailbox, sizeof(nccl_net_ofi_ctrl_msg_t) * NCCL_OFI_CTRL_MAILBOX_SIZE, NCCL_PTR_HOST, &mr_handle);
+	ret = domain->reg_internal_mr(r_comm->ctrl_mailbox, sizeof(nccl_net_ofi_ctrl_msg_t) * NCCL_OFI_CTRL_MAILBOX_SIZE,
+				      NCCL_PTR_HOST, NCCL_OFI_RDMA_CONTROL_RAIL, l_comm_ep, &mr_handle);
 	if (ret != 0) {
 		NCCL_OFI_WARN("Failed to register memory for the control mailbox: %d", ret);
 		goto error;
@@ -4494,21 +4495,27 @@ static nccl_net_ofi_rdma_recv_comm_t *prepare_recv_comm(nccl_net_ofi_rdma_domain
 		return NULL;
 	}
 
+	/* Initialize context for ctrl buffer freelist */
+	r_comm->ctrl_buff.ctx = flush_freelist_regmr_ctx_t(domain, ep, NCCL_OFI_RDMA_CONTROL_RAIL);
+
 	ret = nccl_ofi_freelist_init_mr(sizeof(nccl_net_ofi_rdma_close_msg_t),
 					8, 8, NCCL_OFI_MAX_REQUESTS, NULL, NULL,
 					freelist_regmr_host_fn,
-					freelist_deregmr_host_fn, domain, 1,
+					freelist_deregmr_host_fn, &r_comm->ctrl_buff.ctx, 1,
 					&r_comm->ctrl_buff.fl);
 	if (ret != 0) {
 		NCCL_OFI_WARN("Call to freelist_init_mr failed: %d", ret);
 		return NULL;
 	}
 
+	/* Initialize context for flush buffer freelist */
+	r_comm->flush_buff.ctx = flush_freelist_regmr_ctx_t(domain, ep, NCCL_OFI_RDMA_CONTROL_RAIL);
+
 	/* Allocate flush buffer freelist */
 	ret = nccl_ofi_freelist_init_mr(NCCL_OFI_DEFAULT_CPU_CACHE_LINE_SIZE * MAX_NUM_RAILS,
 					8, 8, NCCL_OFI_MAX_REQUESTS, NULL, NULL,
 					freelist_regmr_host_fn,
-					freelist_deregmr_host_fn, domain, NCCL_OFI_DEFAULT_CPU_CACHE_LINE_SIZE,
+					freelist_deregmr_host_fn, &r_comm->flush_buff.ctx, NCCL_OFI_DEFAULT_CPU_CACHE_LINE_SIZE,
 					&r_comm->flush_buff.fl);
 	if (ret != 0) {
 		NCCL_OFI_WARN("Call to freelist_init_mr failed for flush buffer: %d", ret);
@@ -5841,11 +5848,14 @@ int nccl_net_ofi_rdma_ep_t::init_rx_buffers()
 		return ret;
 	}
 
+	/* Initialize context for ctrl_rx_buff freelist */
+	this->ctrl_rx_buff.ctx = flush_freelist_regmr_ctx_t(domain_ptr, this, NCCL_OFI_RDMA_CONTROL_RAIL);
+
 	ret = nccl_ofi_freelist_init_mr(this->ctrl_rx_buff_size,
 					ofi_nccl_rdma_min_posted_control_buffers(), 16, 0,
 					NULL, NULL,
 					freelist_regmr_host_fn, freelist_deregmr_host_fn,
-					domain_ptr, 1, &this->ctrl_rx_buff.fl);
+					&this->ctrl_rx_buff.ctx, 1, &this->ctrl_rx_buff.fl);
 	if (ret != 0) {
 		NCCL_OFI_WARN("Failed to init ctrl_rx_buff_fl");
 		if (nccl_ofi_freelist_fini(this->rx_buff_reqs_fl))
@@ -5854,11 +5864,14 @@ int nccl_net_ofi_rdma_ep_t::init_rx_buffers()
 	}
 
 	if (this->eager_rx_buff_size > 0) {
+		/* Initialize context for eager_rx_buff freelist */
+		this->eager_rx_buff.ctx = flush_freelist_regmr_ctx_t(domain_ptr, this, NCCL_OFI_RDMA_DATA_RAIL);
+
 		ret = nccl_ofi_freelist_init_mr(this->eager_rx_buff_size,
 						ofi_nccl_rdma_min_posted_eager_buffers(), 16, 0,
 						NULL, NULL,
 						freelist_regmr_host_fn, freelist_deregmr_host_fn,
-						domain_ptr, EAGER_RX_BUFFER_ALIGNMENT, &this->eager_rx_buff.fl);
+						&this->eager_rx_buff.ctx, EAGER_RX_BUFFER_ALIGNMENT, &this->eager_rx_buff.fl);
 		if (ret != 0) {
 			NCCL_OFI_WARN("Failed to init eager_rx_buff_size");
 			nccl_ofi_freelist_fini(this->ctrl_rx_buff.fl);
@@ -5866,7 +5879,7 @@ int nccl_net_ofi_rdma_ep_t::init_rx_buffers()
 			return ret;
 		}
 	} else {
-		this->eager_rx_buff.fl = NULL;
+		this->eager_rx_buff.fl = nullptr;
 	}
 
 	/*
@@ -6635,6 +6648,17 @@ nccl_net_ofi_ep_t *nccl_net_ofi_rdma_domain_t::create_endpoint(nccl_net_ofi_ep_t
 		ep = nullptr;
 	}
 
+	/* Allocate and register flush buffer now that endpoint exists */
+	if (ep != nullptr) {
+		ret = alloc_and_reg_flush_buff(device_ptr->dev_id, ep);
+		if (OFI_UNLIKELY(ret != 0)) {
+			NCCL_OFI_WARN("Failed to allocate/register flush buffer");
+			ep->cleanup_resources();
+			delete ep;
+			ep = nullptr;
+		}
+	}
+
 	return ep;
 }
 
@@ -6789,14 +6813,6 @@ nccl_net_ofi_rdma_domain_t::nccl_net_ofi_rdma_domain_t(nccl_net_ofi_rdma_device_
 			throw std::runtime_error("RDMA domain constructor: ofi domain creation failed");
 		}
 		domain_rail->domain = std::move(domain_result.resource);
-	}
-
-	/*
-	 * Setup flush resources.
-	 */
-	ret = this->alloc_and_reg_flush_buff(device_arg->dev_id);
-	if (OFI_UNLIKELY(ret != 0)) {
-		throw std::runtime_error("RDMA domain constructor: flush buffer alloc/reg failed");
 	}
 
 	/* Create scheduler */
