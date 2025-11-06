@@ -1899,7 +1899,7 @@ static inline int free_send_close_req(nccl_net_ofi_rdma_req_t *req,
 	}
 
 	if (send_close_data->ctrl_fl_elem) {
-		nccl_ofi_freelist_entry_free(r_comm->ctrl_buff_fl, send_close_data->ctrl_fl_elem);
+		nccl_ofi_freelist_entry_free(r_comm->ctrl_buff.fl, send_close_data->ctrl_fl_elem);
 		send_close_data->ctrl_fl_elem = NULL;
 	}
 
@@ -1922,7 +1922,7 @@ static inline int free_flush_req(nccl_net_ofi_rdma_req_t *req,
 
 	// Free flush buffer
 	if (flush_data->flush_fl_elem) {
-		nccl_ofi_freelist_entry_free(r_comm->flush_buff_fl, flush_data->flush_fl_elem);
+		nccl_ofi_freelist_entry_free(r_comm->flush_buff.fl, flush_data->flush_fl_elem);
 		flush_data->flush_fl_elem = NULL;
 	}
 	return free_base_req(&r_comm->num_inflight_reqs, r_comm->nccl_ofi_reqs_fl,
@@ -1952,7 +1952,7 @@ static inline int eager_rx_buff_req_free(nccl_net_ofi_rdma_req_t *req,
 
 	/* Free buffer */
 	if (rx_buff_data->rx_buff_fl_elem) {
-		nccl_ofi_freelist_entry_free(ep->eager_rx_buff_fl, rx_buff_data->rx_buff_fl_elem);
+		nccl_ofi_freelist_entry_free(ep->eager_rx_buff.fl, rx_buff_data->rx_buff_fl_elem);
 	}
 	return free_base_req(NULL, ep->rx_buff_reqs_fl, req, false);
 }
@@ -1973,7 +1973,7 @@ static inline nccl_net_ofi_rdma_req_t *eager_rx_buff_req_alloc(nccl_net_ofi_rdma
 	rdma_req_rx_buff_data_t *rx_buff_data = get_rx_buff_data(req);
 
 	nccl_ofi_freelist_elem_t *rx_buff_fl_elem =
-		nccl_ofi_freelist_entry_alloc(ep->eager_rx_buff_fl);
+		nccl_ofi_freelist_entry_alloc(ep->eager_rx_buff.fl);
 	if (!rx_buff_fl_elem) {
 		NCCL_OFI_WARN("Failed to allocate rx_buff_fl_elem");
 		req->free(req, false);
@@ -1996,7 +1996,7 @@ static inline int ctrl_rx_buff_req_free(nccl_net_ofi_rdma_req_t *req,
 	nccl_net_ofi_rdma_ep_t *ep = rx_buff_data->ep;
 	/* Free buffer */
 	if (rx_buff_data->rx_buff_fl_elem) {
-		nccl_ofi_freelist_entry_free(ep->ctrl_rx_buff_fl, rx_buff_data->rx_buff_fl_elem);
+		nccl_ofi_freelist_entry_free(ep->ctrl_rx_buff.fl, rx_buff_data->rx_buff_fl_elem);
 	}
 	return free_base_req(NULL, ep->rx_buff_reqs_fl, req, false);
 }
@@ -2015,7 +2015,7 @@ static inline nccl_net_ofi_rdma_req_t *ctrl_rx_buff_req_alloc(nccl_net_ofi_rdma_
 	rdma_req_rx_buff_data_t *rx_buff_data = get_rx_buff_data(req);
 
 	nccl_ofi_freelist_elem_t *rx_buff_fl_elem =
-		nccl_ofi_freelist_entry_alloc(ep->ctrl_rx_buff_fl);
+		nccl_ofi_freelist_entry_alloc(ep->ctrl_rx_buff.fl);
 	if (!rx_buff_fl_elem) {
 		NCCL_OFI_WARN("Failed to allocate rx_buff_fl_elem");
 		req->free(req, false);
@@ -2552,7 +2552,6 @@ int nccl_net_ofi_rdma_domain_t::dereg_mr_no_lock(nccl_net_ofi_rdma_mr_handle_t *
 int nccl_net_ofi_rdma_domain_t::reg_mr_on_device(nccl_ofi_mr_ckey_ref ckey,
 						 int type,
 						 nccl_ofi_rdma_rail_type_t rail_type,
-						 nccl_net_ofi_rdma_ep_t *ep,
 						 nccl_net_ofi_rdma_mr_handle_t **mhandle)
 {
 	int ret = 0;
@@ -2561,6 +2560,8 @@ int nccl_net_ofi_rdma_domain_t::reg_mr_on_device(nccl_ofi_mr_ckey_ref ckey,
 	nccl_ofi_idpool_t *key_pool = this->mr_rkey_pool;
 
 	*mhandle = NULL;
+
+	nccl_net_ofi_rdma_ep_t *ep = (nccl_net_ofi_rdma_ep_t *)ckey->ep;
 
 	uint16_t nrails = (rail_type == NCCL_OFI_RDMA_DATA_RAIL) ?
 		ep->num_rails : ep->num_control_rails;
@@ -2633,7 +2634,6 @@ error:
 int nccl_net_ofi_rdma_domain_t::reg_mr(nccl_ofi_mr_ckey_ref ckey,
 				       int type,
 				       nccl_ofi_rdma_rail_type_t rail_type,
-				       nccl_net_ofi_rdma_ep_t *ep,
 				       nccl_net_ofi_rdma_mr_handle_t **mhandle)
 {
 	int ret = 0;
@@ -2656,7 +2656,7 @@ int nccl_net_ofi_rdma_domain_t::reg_mr(nccl_ofi_mr_ckey_ref ckey,
 		}
 		/* Cache miss */
 
-		ret = this->reg_mr_on_device(ckey, type, rail_type, ep, &ret_handle);
+		ret = this->reg_mr_on_device(ckey, type, rail_type, &ret_handle);
 		if (OFI_UNLIKELY(ret != 0)) {
 			return ret;
 		}
@@ -2672,7 +2672,7 @@ int nccl_net_ofi_rdma_domain_t::reg_mr(nccl_ofi_mr_ckey_ref ckey,
 			return ret;
 		}
 	} else {
-		ret = this->reg_mr_on_device(ckey, type, rail_type, ep, &ret_handle);
+		ret = this->reg_mr_on_device(ckey, type, rail_type, &ret_handle);
 		if (OFI_UNLIKELY(ret != 0)) {
 			return ret;
 		}
@@ -2694,7 +2694,7 @@ int nccl_net_ofi_rdma_domain_t::reg_internal_mr(void *data,
 	assert(NCCL_OFI_IS_ALIGNED(size, system_page_size));
 
 	const nccl_ofi_mr_ckey_t ckey = nccl_ofi_mr_ckey_mk_vec(data, size, ep);
-	return this->reg_mr(&ckey, type, rail_type, ep, mhandle);
+	return this->reg_mr(&ckey, type, rail_type, mhandle);
 }
 
 #if HAVE_DECL_FI_MR_DMABUF
@@ -2708,7 +2708,7 @@ int nccl_net_ofi_rdma_domain_t::reg_internal_mr_dma_buf(void *data,
 	assert(NCCL_OFI_IS_ALIGNED(size, system_page_size));
 
 	const nccl_ofi_mr_ckey_t ckey = nccl_ofi_mr_ckey_mk_dmabuf(fd, offset, size, data, ep);
-	return this->reg_mr(&ckey, type, rail_type, ep, mhandle);
+	return this->reg_mr(&ckey, type, rail_type, mhandle);
 }
 #endif
 
@@ -2725,7 +2725,6 @@ static int reg_mr_send_comm(nccl_net_ofi_send_comm_t *send_comm,
 	return domain->reg_mr(ckey,
 			      type,
 			      NCCL_OFI_RDMA_DATA_RAIL,
-			      ep,
 			      (nccl_net_ofi_rdma_mr_handle_t **)mhandle);
 }
 
@@ -2742,7 +2741,6 @@ static int reg_mr_recv_comm(nccl_net_ofi_recv_comm_t *recv_comm,
 	return domain->reg_mr(ckey,
 			      type,
 			      NCCL_OFI_RDMA_DATA_RAIL,
-			      ep,
 			      (nccl_net_ofi_rdma_mr_handle_t **)mhandle);
 }
 
@@ -2761,9 +2759,10 @@ typedef struct {
  * @param	size
  *		Size of memory region. Must be a multiple of page size.
  */
-static int freelist_regmr_host_fn(void *domain_void_ptr, void *data, size_t size, void **handle)
+static int freelist_regmr_host_fn(void *flush_ctx_void_ptr, void *data, size_t size, void **handle)
 {
-	nccl_net_ofi_rdma_domain_t *domain = (nccl_net_ofi_rdma_domain_t *)domain_void_ptr;
+	flush_freelist_regmr_ctx_t *flush_ctx = (flush_freelist_regmr_ctx_t *)flush_ctx_void_ptr;
+	nccl_net_ofi_rdma_domain_t *domain = flush_ctx->domain;
 
 	nccl_net_ofi_rdma_mr_handle_t *mr_handle;
 
@@ -2774,7 +2773,7 @@ static int freelist_regmr_host_fn(void *domain_void_ptr, void *data, size_t size
 		return -ENOMEM;
 	}
 
-        int ret = domain->reg_internal_mr(data, size, NCCL_PTR_HOST, &mr_handle);
+        int ret = domain->reg_internal_mr(data, size, NCCL_PTR_HOST, flush_ctx->rail_type, flush_ctx->ep, &mr_handle);
 	if (ret != 0) {
 		NCCL_OFI_WARN("Failed call to reg_mr: %d", ret);
 		free(freelist_handle);
@@ -3430,13 +3429,13 @@ static int recv_comm_destroy(nccl_net_ofi_rdma_recv_comm_t *r_comm)
 	/* Deregister mr for control messages */
 	domain->dereg_mr(r_comm->ctrl_mr_handle);
 
-	ret = nccl_ofi_freelist_fini(r_comm->ctrl_buff_fl);
+	ret = nccl_ofi_freelist_fini(r_comm->ctrl_buff.fl);
 	if (ret != 0) {
 		NCCL_OFI_WARN("Call to nccl_ofi_freelist_fini failed: %d", ret);
 		return ret;
 	}
 
-	ret = nccl_ofi_freelist_fini(r_comm->flush_buff_fl);
+	ret = nccl_ofi_freelist_fini(r_comm->flush_buff.fl);
 	if (ret != 0) {
 		NCCL_OFI_WARN("Call to nccl_ofi_freelist_fini failed: %d", ret);
 		return ret;
@@ -3503,7 +3502,7 @@ static inline int recv_comm_insert_send_close_req(nccl_net_ofi_rdma_recv_comm_t 
 	 * Set up send close message
 	 */
 	send_close_data->ctrl_fl_elem = nccl_ofi_freelist_entry_alloc
-		(r_comm->ctrl_buff_fl);
+		(r_comm->ctrl_buff.fl);
 	if (send_close_data->ctrl_fl_elem == NULL) {
 		NCCL_OFI_WARN("Call to nccl_ofi_freelist_entry_alloc failed");
 		send_close_req->free(send_close_req, false);
@@ -3922,7 +3921,7 @@ static int rdma_comm_alloc_flush_req(nccl_net_ofi_rdma_recv_comm_t *r_comm,
 	flush_data = get_flush_data(req);
 	flush_data->data = buff;
 	flush_data->mr_handle = buff_mr_handle;
-	flush_data->flush_fl_elem = nccl_ofi_freelist_entry_alloc(r_comm->flush_buff_fl);
+	flush_data->flush_fl_elem = nccl_ofi_freelist_entry_alloc(r_comm->flush_buff.fl);
 	if (OFI_UNLIKELY(flush_data->flush_fl_elem == NULL)) {
 		NCCL_OFI_WARN("Unable to get allocate flush buffer for device %d", dev_id);
 		return -ENOMEM;
@@ -4499,7 +4498,7 @@ static nccl_net_ofi_rdma_recv_comm_t *prepare_recv_comm(nccl_net_ofi_rdma_domain
 					8, 8, NCCL_OFI_MAX_REQUESTS, NULL, NULL,
 					freelist_regmr_host_fn,
 					freelist_deregmr_host_fn, domain, 1,
-					&r_comm->ctrl_buff_fl);
+					&r_comm->ctrl_buff.fl);
 	if (ret != 0) {
 		NCCL_OFI_WARN("Call to freelist_init_mr failed: %d", ret);
 		return NULL;
@@ -4510,7 +4509,7 @@ static nccl_net_ofi_rdma_recv_comm_t *prepare_recv_comm(nccl_net_ofi_rdma_domain
 					8, 8, NCCL_OFI_MAX_REQUESTS, NULL, NULL,
 					freelist_regmr_host_fn,
 					freelist_deregmr_host_fn, domain, NCCL_OFI_DEFAULT_CPU_CACHE_LINE_SIZE,
-					&r_comm->flush_buff_fl);
+					&r_comm->flush_buff.fl);
 	if (ret != 0) {
 		NCCL_OFI_WARN("Call to freelist_init_mr failed for flush buffer: %d", ret);
 		return NULL;
@@ -5144,7 +5143,7 @@ static int post_rx_buffer(nccl_net_ofi_rdma_req_t *req,
 	assert(req->type != NCCL_OFI_RDMA_EAGER_RX_BUFF || ep->eager_rx_buff_size > 0);
 
 	nccl_ofi_freelist_t *fl = (req->type == NCCL_OFI_RDMA_EAGER_RX_BUFF ?
-		ep->eager_rx_buff_fl : ep->ctrl_rx_buff_fl);
+		ep->eager_rx_buff.fl : ep->ctrl_rx_buff.fl);
 	nccl_ofi_freelist_entry_set_undefined(fl, rx_buff_fl_elem->ptr);
 
 	iov.iov_base = rx_buff_fl_elem->ptr;
@@ -5846,7 +5845,7 @@ int nccl_net_ofi_rdma_ep_t::init_rx_buffers()
 					ofi_nccl_rdma_min_posted_control_buffers(), 16, 0,
 					NULL, NULL,
 					freelist_regmr_host_fn, freelist_deregmr_host_fn,
-					domain_ptr, 1, &this->ctrl_rx_buff_fl);
+					domain_ptr, 1, &this->ctrl_rx_buff.fl);
 	if (ret != 0) {
 		NCCL_OFI_WARN("Failed to init ctrl_rx_buff_fl");
 		if (nccl_ofi_freelist_fini(this->rx_buff_reqs_fl))
@@ -5859,15 +5858,15 @@ int nccl_net_ofi_rdma_ep_t::init_rx_buffers()
 						ofi_nccl_rdma_min_posted_eager_buffers(), 16, 0,
 						NULL, NULL,
 						freelist_regmr_host_fn, freelist_deregmr_host_fn,
-						domain_ptr, EAGER_RX_BUFFER_ALIGNMENT, &this->eager_rx_buff_fl);
+						domain_ptr, EAGER_RX_BUFFER_ALIGNMENT, &this->eager_rx_buff.fl);
 		if (ret != 0) {
 			NCCL_OFI_WARN("Failed to init eager_rx_buff_size");
-			nccl_ofi_freelist_fini(this->ctrl_rx_buff_fl);
+			nccl_ofi_freelist_fini(this->ctrl_rx_buff.fl);
 			nccl_ofi_freelist_fini(this->rx_buff_reqs_fl);
 			return ret;
 		}
 	} else {
-		this->eager_rx_buff_fl = NULL;
+		this->eager_rx_buff.fl = NULL;
 	}
 
 	/*
@@ -5916,14 +5915,14 @@ int nccl_net_ofi_rdma_ep_t::fini_rx_buffers()
 	int ret = 0;
 	nccl_net_ofi_rdma_ep_rail_t *rail;
 
-	ret = nccl_ofi_freelist_fini(this->ctrl_rx_buff_fl);
+	ret = nccl_ofi_freelist_fini(this->ctrl_rx_buff.fl);
 	if (ret != 0) {
 		NCCL_OFI_WARN("Failed to fini ctrl_rx_buff_fl");
 		return ret;
 	}
 
-	if (this->eager_rx_buff_fl != NULL) {
-		ret = nccl_ofi_freelist_fini(this->eager_rx_buff_fl);
+	if (this->eager_rx_buff.fl != NULL) {
+		ret = nccl_ofi_freelist_fini(this->eager_rx_buff.fl);
 		if (ret != 0) {
 			NCCL_OFI_WARN("Failed to fini eager_rx_buff_fl");
 			return ret;
