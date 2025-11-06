@@ -2589,7 +2589,7 @@ int nccl_net_ofi_rdma_domain_t::reg_mr_on_device(nccl_ofi_mr_ckey_ref ckey,
 	}
 
 	/* Register memory on each rail */
-	for (uint16_t rail_id = 0; rail_id != num_rails; ++rail_id) {
+	for (uint16_t rail_id = 0; rail_id != nrails; ++rail_id) {
 		nccl_net_ofi_rdma_domain_rail_t *domain_rail = this->rdma_domain_get_rail(rail_id);
 
 		auto mr_result = nccl_ofi_ofiutils_mr_regattr(domain_rail->domain,
@@ -2602,6 +2602,26 @@ int nccl_net_ofi_rdma_domain_t::reg_mr_on_device(nccl_ofi_mr_ckey_ref ckey,
 			goto error;
 		}
 		ret_handle->mr[rail_id] = std::move(mr_result.resource);
+
+		if (ep) {
+			nccl_net_ofi_ep_rail_t *ep_rail = (rail_type == NCCL_OFI_RDMA_CONTROL_RAIL) ?
+                                ep->rdma_endpoint_get_control_rail(rail_id) : ep->rdma_endpoint_get_rail(rail_id);
+                        struct fid_ep *ofi_ep = ep_rail->ofi_ep.get();
+
+                        int bind_ret = fi_mr_bind(ret_handle->mr[rail_id].get(), &ofi_ep->fid, 0);
+                        if (bind_ret != 0) {
+                                NCCL_OFI_WARN("fi_mr_bind failed on rail %u with rc=%d", rail_id, bind_ret);
+                                ret = bind_ret;
+                                goto error;
+                        }
+
+                        int enable_ret = fi_mr_enable(ret_handle->mr[rail_id].get());
+                        if (enable_ret != 0) {
+                                NCCL_OFI_WARN("fi_mr_enable failed on rail %u with rc=%d", rail_id, enable_ret);
+                                ret = enable_ret;
+                                goto error;
+                        }
+                }
 	}
 
 	*mhandle = ret_handle;
@@ -6977,7 +6997,7 @@ static void get_hints(struct fi_info *hints)
 	hints->ep_attr->type = FI_EP_RDM;
 
 	hints->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_HMEM | FI_MR_VIRT_ADDR |
-		FI_MR_ALLOCATED | FI_MR_PROV_KEY;
+		FI_MR_ALLOCATED | FI_MR_PROV_KEY | FI_MR_ENDPOINT;
 	hints->domain_attr->mr_key_size = (size_t) ofi_nccl_mr_key_size();
 	hints->domain_attr->threading = FI_THREAD_SAFE;
 
@@ -7179,11 +7199,6 @@ int nccl_net_ofi_rdma_init(const char *provider_filter,
 	if (ret != 0) {
 		NCCL_OFI_WARN("Querying provider capabilities failed: %d", ret);
 		return ret;
-	}
-
-	if (endpoint_mr) {
-		NCCL_OFI_WARN("RDMA protocol does not support endpoint memory registration.");
-		return -ENOTSUP;
 	}
 
 	if ((ssize_t)ofi_nccl_eager_max_size() > (ssize_t)ofi_nccl_min_stripe_size()) {
