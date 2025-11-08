@@ -104,6 +104,13 @@ typedef enum nccl_net_ofi_rdma_req_type {
 	NCCL_OFI_RDMA_INVALID_TYPE,
 } nccl_net_ofi_rdma_req_type_t;
 
+/* Distinguish data rails used for payload transfer from control rails
+ * used for protocol bookkeeping (mailboxes, control messages). */
+typedef enum nccl_ofi_rdma_rail_type {
+       NCCL_OFI_RDMA_DATA_RAIL,
+       NCCL_OFI_RDMA_CONTROL_RAIL,
+} nccl_ofi_rdma_rail_type_t;
+
 enum nccl_ofi_rdma_msg_type {
 	NCCL_OFI_RDMA_MSG_CTRL,
 	NCCL_OFI_RDMA_MSG_EAGER,
@@ -245,6 +252,39 @@ class nccl_net_ofi_rdma_ep_t;
 class nccl_net_ofi_rdma_device_rail_t;
 class nccl_net_ofi_rdma_domain_rail_t;
 class nccl_net_ofi_ep_rail_t;
+
+/* Registration context for flush buffer and MR allocation */
+/**
+ * @brief Context structure for freelist memory registration callbacks.
+ *
+ * This struct holds the necessary information (domain, endpoint, rail type)
+ * that is passed to the freelist's memory registration and deregistration
+ * callback functions (freelist_regmr_host_fn and freelist_deregmr_host_fn).
+ * It provides the context needed to register memory regions for RDMA operations.
+ */
+struct flush_freelist_regmr_ctx {
+       nccl_net_ofi_rdma_domain_t *domain;
+       nccl_net_ofi_rdma_ep_t *ep;
+       nccl_ofi_rdma_rail_type_t rail_type;
+
+       flush_freelist_regmr_ctx() : domain(nullptr), ep(nullptr), rail_type(NCCL_OFI_RDMA_CONTROL_RAIL) {}
+       flush_freelist_regmr_ctx(nccl_net_ofi_rdma_domain_t *d, nccl_net_ofi_rdma_ep_t *e, nccl_ofi_rdma_rail_type_t r)
+           : domain(d), ep(e), rail_type(r) {}
+};
+typedef struct flush_freelist_regmr_ctx flush_freelist_regmr_ctx_t;
+
+/**
+ * @brief Structure grouping a freelist with its memory registration context.
+ *
+ * This struct bundles a freelist pointer with its associated registration context
+ * to keep related data together and improve code organization. The context is
+ * used during freelist initialization for memory registration callbacks.
+ */
+struct freelist_with_ctx {
+    nccl_ofi_freelist_t *fl;
+    flush_freelist_regmr_ctx_t ctx;
+};
+typedef struct freelist_with_ctx freelist_with_ctx_t;
 
 struct nccl_net_ofi_rdma_req;
 typedef struct nccl_net_ofi_rdma_req nccl_net_ofi_rdma_req_t;
@@ -630,10 +670,10 @@ typedef struct nccl_net_ofi_rdma_recv_comm {
 	nccl_ofi_msgbuff_t *msgbuff;
 
 	/* Free list to track control buffers, for sending RDMA control messages */
-	nccl_ofi_freelist_t *ctrl_buff_fl;
+	freelist_with_ctx_t ctrl_buff;
 
 	/* Free list to track host flush buffers, for sending flush messages */
-	nccl_ofi_freelist_t *flush_buff_fl;
+	freelist_with_ctx_t flush_buff;
 
 #if HAVE_NVTX_TRACING
 	nvtxDomainHandle_t nvtx_domain[NCCL_OFI_N_NVTX_DOMAIN_PER_COMM];
@@ -758,6 +798,8 @@ public:
 	 */
 	int reg_mr(nccl_ofi_mr_ckey_ref ckey,
 		   int type,
+		   nccl_ofi_rdma_rail_type_t rail_type,
+		   nccl_net_ofi_rdma_ep_t *ep,
 		   nccl_net_ofi_rdma_mr_handle_t **mhandle);
 
 	/**
@@ -813,11 +855,15 @@ public:
 	 */
 	int reg_internal_mr(void *data,
 			    size_t size, int type,
+			    nccl_ofi_rdma_rail_type_t rail_type,
+			    nccl_net_ofi_rdma_ep_t *ep,
 			    nccl_net_ofi_rdma_mr_handle_t **mhandle);
 
 #if HAVE_DECL_FI_MR_DMABUF
 	int reg_internal_mr_dma_buf(void *data,
 				int fd, uint64_t offset, size_t size, int type,
+				nccl_ofi_rdma_rail_type_t rail_type,
+				nccl_net_ofi_rdma_ep_t *ep,
 				nccl_net_ofi_rdma_mr_handle_t **mhandle);
 #endif
 	/**
@@ -879,7 +925,7 @@ protected:
 	 * @return	0, on success
 	 * 		error, on others
 	 */
-	int alloc_and_reg_flush_buff(int dev_id);
+	int alloc_and_reg_flush_buff(int dev_id, nccl_net_ofi_rdma_ep_t *ep);
 
 	/**
 	 * @brief	Deregister flush buffer if flush buffer was registered. Deallocate flush buffer.
@@ -892,6 +938,8 @@ protected:
 private:
 	int reg_mr_on_device(nccl_ofi_mr_ckey_ref ckey,
 			     int type,
+			     nccl_ofi_rdma_rail_type_t rail_type,
+			     nccl_net_ofi_rdma_ep_t *ep,
 			     nccl_net_ofi_rdma_mr_handle_t **mhandle);
 
 	/**
@@ -1183,9 +1231,9 @@ public:
 	pthread_mutex_t pending_reqs_lock;
 
 	/* Free list of ctrl rx buffers */
-	nccl_ofi_freelist_t *ctrl_rx_buff_fl = nullptr;
+	freelist_with_ctx_t ctrl_rx_buff;
 	/* Free list of eager rx buffers */
-	nccl_ofi_freelist_t *eager_rx_buff_fl = nullptr;
+	freelist_with_ctx_t eager_rx_buff;
 	/* Free list of rx buffer requests */
 	nccl_ofi_freelist_t *rx_buff_reqs_fl = nullptr;
 	/* Size of ctrl rx buffers */
