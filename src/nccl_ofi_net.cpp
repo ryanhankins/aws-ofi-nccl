@@ -603,11 +603,11 @@ int nccl_net_ofi_query_provider_capabilities(const struct fi_info *selected_prov
 
 	/* Check if provider uses endpoint memory registration */
 	if (selected_provider->domain_attr->mr_mode & FI_MR_ENDPOINT) {
-		NCCL_OFI_TRACE(NCCL_INIT | NCCL_NET, "Provider %s requires endpoint memory registration",
+		NCCL_OFI_INFO(NCCL_INIT | NCCL_NET, "Provider %s requires endpoint memory registration (FI_MR_ENDPOINT=true)",
 			       selected_provider->fabric_attr->prov_name);
 		endpoint_mr = true;
 	} else {
-		NCCL_OFI_TRACE(NCCL_INIT | NCCL_NET, "Provider %s does not require endpoint memory registration",
+		NCCL_OFI_INFO(NCCL_INIT | NCCL_NET, "Provider %s does not require endpoint memory registration (FI_MR_ENDPOINT=false)",
 			       selected_provider->fabric_attr->prov_name);
 		endpoint_mr = false;
 	}

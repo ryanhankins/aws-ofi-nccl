@@ -2579,6 +2579,29 @@ int nccl_net_ofi_rdma_domain_t::dereg_mr_no_lock(nccl_net_ofi_rdma_mr_handle_t *
 }
 
 
+int nccl_net_ofi_rdma_domain_t::mr_bind_and_enable(struct fid_mr *mr,
+						   struct fid_ep *ofi_ep,
+						   uint16_t rail_id,
+						   const char *rail_type)
+{
+	int ret = fi_mr_bind(mr, &ofi_ep->fid, 0);
+	if (ret != 0) {
+		NCCL_OFI_WARN("fi_mr_bind (%s rail %u) failed: rc=%d, error=%s",
+			      rail_type, rail_id, ret, fi_strerror(-ret));
+		return ret;
+	}
+
+	ret = fi_mr_enable(mr);
+	if (ret != 0) {
+		NCCL_OFI_WARN("fi_mr_enable failed on %s rail %u with rc=%d, error=%s",
+			      rail_type, rail_id, ret, fi_strerror(-ret));
+		return ret;
+	}
+
+	return 0;
+}
+
+
 int nccl_net_ofi_rdma_domain_t::reg_mr_on_device(nccl_ofi_mr_ckey_ref ckey,
 						 int type,
 						 nccl_net_ofi_rdma_ep_t *ep,
@@ -2613,7 +2636,7 @@ int nccl_net_ofi_rdma_domain_t::reg_mr_on_device(nccl_ofi_mr_ckey_ref ckey,
 		goto error;
 	}
 
-	/* Register memory on each rail */
+	/* Register and bind memory on each data rail */
 	for (uint16_t rail_id = 0; rail_id != num_rails; ++rail_id) {
 		nccl_net_ofi_rdma_domain_rail_t *domain_rail = this->rdma_domain_get_rail(rail_id);
 
@@ -2621,12 +2644,46 @@ int nccl_net_ofi_rdma_domain_t::reg_mr_on_device(nccl_ofi_mr_ckey_ref ckey,
 							      &mr_attr,
 							      regattr_flags);
 		if (OFI_UNLIKELY(mr_result.is_failure())) {
-			NCCL_OFI_WARN("Could not register memory on rail %u with flag %lu",
+			NCCL_OFI_WARN("Could not register memory on data rail %u with flag %lu",
 				      rail_id, regattr_flags);
 			ret = mr_result.error_code;
 			goto error;
 		}
 		ret_handle->mr_data[rail_id] = std::move(mr_result.resource);
+
+		if (ep != nullptr) {
+			nccl_net_ofi_rdma_ep_rail_t *ep_rail = ep->rdma_endpoint_get_rail(rail_id);
+			struct fid_ep *ofi_ep = ep_rail->ofi_ep.get();
+			ret = mr_bind_and_enable(ret_handle->mr_data[rail_id].get(), ofi_ep,
+						 rail_id, "data");
+			if (ret != 0) goto error;
+		}
+	}
+
+	/* Register and bind memory on each ctrl rail.
+	 * With FI_MR_ENDPOINT a single fid_mr may only be bound to one fid_ep,
+	 * so ctrl-rail registrations are kept separate in mr_ctrl[]. */
+	if (ep != nullptr) {
+		for (uint16_t rail_id = 0; rail_id != nctrl; ++rail_id) {
+			nccl_net_ofi_rdma_domain_rail_t *domain_rail = this->rdma_domain_get_rail(rail_id);
+
+			auto mr_result = nccl_ofi_ofiutils_mr_regattr(domain_rail->domain,
+								      &mr_attr,
+								      regattr_flags);
+			if (OFI_UNLIKELY(mr_result.is_failure())) {
+				NCCL_OFI_WARN("Could not register memory on ctrl rail %u with flag %lu",
+					      rail_id, regattr_flags);
+				ret = mr_result.error_code;
+				goto error;
+			}
+			ret_handle->mr_ctrl[rail_id] = std::move(mr_result.resource);
+
+			nccl_net_ofi_rdma_ep_rail_t *ctrl_rail = ep->rdma_endpoint_get_control_rail(rail_id);
+			struct fid_ep *ctrl_ofi_ep = ctrl_rail->ofi_ep.get();
+			ret = mr_bind_and_enable(ret_handle->mr_ctrl[rail_id].get(), ctrl_ofi_ep,
+						 rail_id, "ctrl");
+			if (ret != 0) goto error;
+		}
 	}
 
 	/* Store base address of registered memory region for offset calculations.
@@ -7043,7 +7100,7 @@ static void get_hints(struct fi_info *hints)
 	hints->ep_attr->type = FI_EP_RDM;
 
 	hints->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_HMEM | FI_MR_VIRT_ADDR |
-		FI_MR_ALLOCATED | FI_MR_PROV_KEY;
+		FI_MR_ALLOCATED | FI_MR_PROV_KEY | FI_MR_ENDPOINT;
 	hints->domain_attr->mr_key_size = (size_t) ofi_nccl_mr_key_size();
 	hints->domain_attr->threading = FI_THREAD_COMPLETION;
 
@@ -7239,11 +7296,6 @@ int nccl_net_ofi_rdma_init(const char *provider_filter,
 	if (ret != 0) {
 		NCCL_OFI_WARN("Querying provider capabilities failed: %d", ret);
 		return ret;
-	}
-
-	if (endpoint_mr) {
-		NCCL_OFI_WARN("RDMA protocol does not support endpoint memory registration.");
-		return -ENOTSUP;
 	}
 
 	if ((ssize_t)ofi_nccl_eager_max_size() > (ssize_t)ofi_nccl_min_stripe_size()) {
