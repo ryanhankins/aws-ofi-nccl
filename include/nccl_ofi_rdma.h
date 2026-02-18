@@ -662,6 +662,10 @@ typedef struct nccl_net_ofi_rdma_recv_comm {
 	/* Free list to track host flush buffers, for sending flush messages */
 	nccl_ofi_freelist *flush_buff_fl;
 
+	/* Opaque context (freelist_regmr_ep_ctx_t *) shared by ctrl_buff_fl and
+	 * flush_buff_fl registration callbacks.  Freed in free_rdma_recv_comm(). */
+	void *comm_buff_regmr_ctx;
+
 #if HAVE_NVTX_TRACING
 	nvtxDomainHandle_t nvtx_domain[NCCL_OFI_N_NVTX_DOMAIN_PER_COMM];
 #endif
@@ -1292,6 +1296,9 @@ public:
 	nccl_ofi_freelist *eager_rx_buff_fl = nullptr;
 	/* Free list of rx buffer requests */
 	nccl_ofi_freelist *rx_buff_reqs_fl = nullptr;
+	/* Opaque context passed to freelist_regmr_host_fn for rx buffer freelists.
+	 * Heap-allocated freelist_regmr_ep_ctx_t; freed in fini_rx_buffers(). */
+	void *rx_buff_regmr_ctx = nullptr;
 	/* Size of ctrl rx buffers */
 	size_t ctrl_rx_buff_size;
 	/* Size of eager rx buffers.  Will be -1 if eager is entirely
