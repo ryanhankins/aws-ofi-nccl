@@ -2591,7 +2591,7 @@ int nccl_net_ofi_rdma_domain_t::reg_mr_on_device(nccl_ofi_mr_ckey_ref ckey,
 	*mhandle = NULL;
 
 	/* Allocate rdma memory registration handle */
-	auto *ret_handle = new nccl_net_ofi_rdma_mr_handle_t(num_rails);
+	auto *ret_handle = new nccl_net_ofi_rdma_mr_handle_t(num_rails, 0);
 
 	if (key_pool->get_size() != 0) {
 		auto key = key_pool->allocate_id();
@@ -2624,7 +2624,7 @@ int nccl_net_ofi_rdma_domain_t::reg_mr_on_device(nccl_ofi_mr_ckey_ref ckey,
 			ret = mr_result.error_code;
 			goto error;
 		}
-		ret_handle->mr[rail_id] = std::move(mr_result.resource);
+		ret_handle->mr_data[rail_id] = std::move(mr_result.resource);
 	}
 
 	/* Store base address of registered memory region for offset calculations.
@@ -2944,7 +2944,7 @@ static inline int allocate_rdma_recv_req(
 
 	uint16_t rail_id = 0;
 	for (; rail_id < r_comm->num_rails; rail_id++) {
-		uint64_t rkey = fi_mr_key(buff_mr_handle->mr[rail_id].get());
+		uint64_t rkey = fi_mr_key(buff_mr_handle->mr_data[rail_id].get());
 
 		if (rkey == FI_KEY_NOTAVAIL) {
 			NCCL_OFI_WARN("RDMA write buffers should be pre-registered");
@@ -4118,7 +4118,7 @@ static int alloc_rdma_read_req(nccl_net_ofi_rdma_recv_comm_t *r_comm,
 			       nccl_net_ofi_rdma_req **ret_req)
 {
 	uint64_t flags = 0;
-	struct fid_mr *rail_mr_handle = buff_mr_handle->mr[0].get();
+	struct fid_mr *rail_mr_handle = buff_mr_handle->mr_data[0].get();
 	void *desc = fi_mr_desc(rail_mr_handle);
 	*ret_req = NULL;
 
@@ -5049,7 +5049,7 @@ static int post_rdma_write(nccl_net_ofi_rdma_req *req,
 	rdma_req_send_data_t *send_data = get_send_data(req);
 	assert(xfer_info->rail_id < send_data->buff_mr_handle->num_rails);
 	uint16_t rail_id = xfer_info->rail_id;
-	struct fid_mr *rail_mr_handle = send_data->buff_mr_handle->mr[rail_id].get();
+	struct fid_mr *rail_mr_handle = send_data->buff_mr_handle->mr_data[rail_id].get();
 	void *desc = fi_mr_desc(rail_mr_handle);
 
 	ssize_t rc;
@@ -5086,7 +5086,7 @@ static int post_rdma_eager_send(nccl_net_ofi_rdma_req *req,
 	rdma_req_send_data_t *send_data = get_send_data(req);
 	assert(xfer_info->rail_id < send_data->buff_mr_handle->num_rails);
 	uint16_t rail_id = xfer_info->rail_id;
-	struct fid_mr *rail_mr_handle = send_data->buff_mr_handle->mr[rail_id].get();
+	struct fid_mr *rail_mr_handle = send_data->buff_mr_handle->mr_data[rail_id].get();
 	void *desc = fi_mr_desc(rail_mr_handle);
 
 	ssize_t rc;
@@ -5111,7 +5111,7 @@ static int post_rx_buffer(nccl_net_ofi_rdma_req *req,
 	nccl_ofi_freelist::fl_entry *rx_buff_fl_elem = rx_buff_data->rx_buff_fl_elem;
 	freelist_regmr_fn_handle_t *fl_mr_handle =
 		(freelist_regmr_fn_handle_t *)rx_buff_fl_elem->mr_handle;
-	void *desc = fi_mr_desc(fl_mr_handle->mr_handle->mr[rx_buff_data->rail->rail_id].get());
+	void *desc = fi_mr_desc(fl_mr_handle->mr_handle->mr_data[rx_buff_data->rail->rail_id].get());
 	struct iovec iov;
 	struct fi_msg msg;
 	uint64_t flags = 0;
@@ -5239,8 +5239,8 @@ static ssize_t send_ctrl_post(nccl_net_ofi_rdma_recv_comm_t *r_comm,
 
 	nccl_net_ofi_rdma_recv_comm_rail_t *comm_rail = rdma_recv_comm_get_control_rail(r_comm, rail_id);
 
-	assert(rail_id < mr_handle->num_rails);
-	void *desc = fi_mr_desc(mr_handle->mr[rail_id].get());
+	assert(rail_id < mr_handle->num_ctrl_rails);
+	void *desc = fi_mr_desc(mr_handle->mr_ctrl[rail_id].get());
 
 	ssize_t rc = fi_send(comm_rail->local_ep, ctrl_fl_elem->ptr,
 			size,
@@ -5287,7 +5287,7 @@ static int post_rdma_ctrl(nccl_net_ofi_rdma_req *req)
 	}
 
 	uint16_t slot = req->msg_seq_num % NCCL_OFI_CTRL_MAILBOX_SIZE;
-	void *desc = fi_mr_desc(r_comm->ctrl_mr_handle->mr[rail_id].get());
+	void *desc = fi_mr_desc(r_comm->ctrl_mr_handle->mr_ctrl[rail_id].get());
 	nccl_net_ofi_rdma_recv_comm_rail_t *comm_rail = rdma_recv_comm_get_control_rail(r_comm, rail_id);
 
 	ssize_t rc = fi_write(comm_rail->local_ep, &r_comm->ctrl_mailbox[slot],
@@ -5358,10 +5358,10 @@ static int post_eager_copy(nccl_net_ofi_rdma_req *req)
 	nccl_net_ofi_rdma_mr_handle_t *dest_mr_handle = recv_data->dest_mr_handle;
 
 	assert(rx_rail_id < dest_mr_handle->num_rails);
-	void *desc = fi_mr_desc(dest_mr_handle->mr[rx_rail_id].get());
+	void *desc = fi_mr_desc(dest_mr_handle->mr_data[rx_rail_id].get());
 
 	void *rx_buff = rx_buff_data->rx_buff_fl_elem->ptr;
-	uint64_t rx_key = fi_mr_key(rx_mr_handle->mr[rx_rail_id].get());
+	uint64_t rx_key = fi_mr_key(rx_mr_handle->mr_data[rx_rail_id].get());
 	if (rx_key == FI_KEY_NOTAVAIL) {
 		NCCL_OFI_WARN("Failed to get rx_key");
 		return -EIO;
@@ -5396,8 +5396,8 @@ static int post_flush_req(nccl_net_ofi_rdma_req *req)
 		comm_rail = rdma_recv_comm_get_rail(r_comm, rail_id);
 		struct fid_mr *mr_handle = NULL;
 
-		void *desc = fi_mr_desc(domain->flush_buff.mr_handle->mr[rail_id].get());
-		mr_handle = flush_data->mr_handle->mr[rail_id].get();
+		void *desc = fi_mr_desc(domain->flush_buff.mr_handle->mr_data[rail_id].get());
+		mr_handle = flush_data->mr_handle->mr_data[rail_id].get();
 
 
 		uint64_t cuda_key = 0ULL;
@@ -5448,8 +5448,8 @@ static int post_flush_req(nccl_net_ofi_rdma_req *req)
 
 		freelist_regmr_fn_handle_t *fl_handle =
 			(freelist_regmr_fn_handle_t *)flush_data->flush_fl_elem->mr_handle;
-		void *desc = fi_mr_desc(fl_handle->mr_handle->mr[rail_id].get());
-		mr_handle = domain->flush_buff.mr_handle->mr[rail_id].get();
+		void *desc = fi_mr_desc(fl_handle->mr_handle->mr_data[rail_id].get());
+		mr_handle = domain->flush_buff.mr_handle->mr_data[rail_id].get();
 		uint64_t cuda_key = 0ULL;
 
 		if (mr_handle != NULL) {
@@ -5741,7 +5741,7 @@ void nccl_net_ofi_rdma_ep_t::prepare_send_connect_message(uint32_t local_comm_id
 
 	/* Send s_comm's control mailbox mr_key */
 	for (uint16_t rail_id = 0; rail_id != num_rails; ++rail_id) {
-		uint64_t rkey = fi_mr_key(ctrl_msg_mr_handle->mr[rail_id].get());
+		uint64_t rkey = fi_mr_key(ctrl_msg_mr_handle->mr_data[rail_id].get());
 		conn_msg->ctrl_mr_key[rail_id] = rkey;
 	}
 
@@ -5925,8 +5925,8 @@ int nccl_net_ofi_rdma_ep_t::fini_rx_buffers()
 int nccl_net_ofi_rdma_mr_handle_t::get_mr_key(uint64_t *mr_key_ptr)
 {
 	int ret = 0;
-	assert(!this->mr.empty());
-	uint64_t key = fi_mr_key(this->mr[0].get());
+	assert(!this->mr_data.empty());
+	uint64_t key = fi_mr_key(this->mr_data[0].get());
 	if (OFI_UNLIKELY(key == FI_KEY_NOTAVAIL)) {
 		ret = -ENOENT;
 		NCCL_OFI_WARN("Error retrieving MR key, leaking key");
@@ -6021,7 +6021,7 @@ static int rma_write(nccl_net_ofi_send_comm_t *send_comm, void* src, size_t size
 		     uint64_t dest, uint64_t mr_key, nccl_net_ofi_req ** base_req)
 {
 	nccl_net_ofi_rdma_mr_handle_t *mr_handle = (nccl_net_ofi_rdma_mr_handle_t *)mhandle;
-	struct fid_mr *rail_mr_handle = mr_handle->mr[0].get();
+	struct fid_mr *rail_mr_handle = mr_handle->mr_data[0].get();
 	void *desc = fi_mr_desc(rail_mr_handle);
 	uint64_t flags = 0;
 	return rma_write_impl(send_comm, src, size, desc, dest, mr_key, flags, base_req);

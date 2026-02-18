@@ -129,27 +129,39 @@ typedef uint16_t nccl_ofi_rdma_msg_type_t;
 class nccl_net_ofi_rdma_mr_handle_t : public nccl_net_ofi_mr_handle_t {
 public:
 	/**
-	 * @brief 	Default constructor
+	 * @brief	Constructor
+	 *
+	 * Every MR handle covers both the data ep rails and the control ep
+	 * rails.  With FI_MR_ENDPOINT a single fid_mr may only be bound to
+	 * one fid_ep, so we keep two separate arrays:
+	 *   mr_data[0..num_rails-1]       — bound to data ep rails
+	 *   mr_ctrl[0..num_ctrl_rails-1]  — bound to ctrl ep rails
 	 */
-	nccl_net_ofi_rdma_mr_handle_t(size_t num_rails_arg)
+	nccl_net_ofi_rdma_mr_handle_t(size_t num_rails_arg, size_t num_ctrl_rails_arg)
 		: nccl_net_ofi_mr_handle_t(0),
 		  num_rails(num_rails_arg),
+		  num_ctrl_rails(num_ctrl_rails_arg),
 		  base_addr(0)
 	{
-		mr.resize(num_rails);
+		mr_data.resize(num_rails);
+		mr_ctrl.resize(num_ctrl_rails);
 	}
 
 	/**
 	 * @brief	Get MR key for RDMA handle
-	 * 
-	 * 		Return MR key associated with first mr array element
+	 *
+	 * 		Return MR key associated with first data mr array element
 	 */
 	int get_mr_key(uint64_t *mr_key_ptr) override;
 
 	uint16_t num_rails;
+	uint16_t num_ctrl_rails;
 
-	/* Array of size `num_rails' */
-	std::vector<ofi_mr_ptr> mr;
+	/* One fid_mr per data ep rail, bound to data ep */
+	std::vector<ofi_mr_ptr> mr_data;
+
+	/* One fid_mr per ctrl ep rail, bound to ctrl ep */
+	std::vector<ofi_mr_ptr> mr_ctrl;
 
 	/* Base address of the registered memory region for offset calculation */
 	uintptr_t base_addr;
