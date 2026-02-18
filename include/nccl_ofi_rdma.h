@@ -918,7 +918,7 @@ protected:
 	 *
 	 * @return	0, on success
 	 * 		error, on others
-	 */			    
+	 */
 	int dealloc_and_dereg_flush_buff();
 
 private:
@@ -1038,6 +1038,8 @@ public:
 	/* Allocate a receive buffer request for this rail (eager or ctrl) */
 	nccl_net_ofi_rdma_req* (*rx_buff_req_alloc)(nccl_net_ofi_rdma_ep_t *ep,
 						      nccl_net_ofi_rdma_ep_rail_t *rail);
+	/* True if this rail posts control (ctrl) rx buffers; false for data (eager) */
+	bool is_ctrl = false;
 };
 
 /**
@@ -1299,6 +1301,12 @@ public:
 	/* Opaque context passed to freelist_regmr_host_fn for rx buffer freelists.
 	 * Heap-allocated freelist_regmr_ep_ctx_t; freed in fini_rx_buffers(). */
 	void *rx_buff_regmr_ctx = nullptr;
+	/* MR handle for the domain-level flush buffer.
+	 * In FI_MR_ENDPOINT mode this is a per-endpoint registration;
+	 * otherwise it is a copy of the domain's shared flush buffer MR.
+	 * Set in init_rx_buffers(); the per-endpoint registration (if any)
+	 * is deregistered in fini_rx_buffers(). */
+	nccl_net_ofi_rdma_mr_handle_t *flush_buff_mr_handle = nullptr;
 	/* Size of ctrl rx buffers */
 	size_t ctrl_rx_buff_size;
 	/* Size of eager rx buffers.  Will be -1 if eager is entirely
